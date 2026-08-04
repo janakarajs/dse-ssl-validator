@@ -4,7 +4,7 @@ A lightweight, **single-file** SSL/TLS health checker for Apache Cassandra / DSE
 Covers **DSE 5.1, 6.7, 6.8, 6.9** and **OpsCenter 6.8** — built for IBM DataStax Support Engineering.
 
 ```
-python validator.py -i inventory.yml
+python3 validator.py -i inventory.yml
 ```
 
 ---
