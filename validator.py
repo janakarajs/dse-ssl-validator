@@ -360,6 +360,25 @@ def check_config(node: Node) -> List[Finding]:
     findings.append(Finding(node.name, "internode_encryption", "INFO",
                             f"internode_encryption = {ie}"))
 
+    # ── enable_legacy_ssl_storage_port ───────────────────────────────────────
+    # When false (DSE 6.x default), SSL traffic runs on port 7000 instead of
+    # the dedicated port 7001.  Record it so port checks don't false-alarm.
+    legacy_ssl_port = node.yaml_data.get("enable_legacy_ssl_storage_port", None)
+    if legacy_ssl_port is False:
+        findings.append(Finding(
+            node.name, "legacy_ssl_storage_port", "INFO",
+            "enable_legacy_ssl_storage_port=false — SSL internode traffic uses "
+            "port 7000 (no separate SSL storage port configured). "
+            "Port 7001 will not be open; this is expected.",
+        ))
+    elif legacy_ssl_port is True:
+        findings.append(Finding(
+            node.name, "legacy_ssl_storage_port", "INFO",
+            "enable_legacy_ssl_storage_port=true — SSL internode traffic uses "
+            "port 7001 (dedicated SSL storage port).",
+        ))
+    # If key is absent from yaml, DSE uses its compiled-in default (false for 6.x)
+
     # Gate fields: keystore, truststore, passwords
     for fld in ("keystore", "keystore_password", "truststore", "truststore_password"):
         if not enc.get(fld):
@@ -792,13 +811,47 @@ def check_tls_pair(src: Node, tgt_host: str, tgt_name: str,
                     f"[{label}] OK  proto={proto}  cipher={cipher}")]
 
 
-def check_tls_mesh(nodes: List[Node], port: int,
-                   timeout: int, threads: int) -> List[Finding]:
+def _internode_ssl_port(node: Node) -> int:
+    """
+    Return the port DSE uses for encrypted internode traffic.
+
+    DSE behaviour:
+      enable_legacy_ssl_storage_port: true  → 7001 (dedicated SSL port)
+      enable_legacy_ssl_storage_port: false → 7000 (SSL multiplexed on
+                                               the normal storage port)
+      key absent                            → same as false for DSE 6.x
+                                             (true for DSE 5.x, but we
+                                              default safe to 7001 there)
+
+    The function checks cassandra.yaml; if the key is absent it falls back
+    to the DSE version heuristic (6.x → 7000, older → 7001).
+    """
+    yaml_val = node.yaml_data.get("enable_legacy_ssl_storage_port")
+
+    if yaml_val is True:
+        return 7001
+
+    if yaml_val is False:
+        return 7000
+
+    # Key absent — infer from DSE version
+    dv = node.dse_version or ""
+    major_m = re.match(r"(\d+)\.", dv)
+    major = int(major_m.group(1)) if major_m else 0
+    return 7000 if major >= 6 else 7001
+
+
+def check_tls_mesh(nodes: List[Node], timeout: int, threads: int) -> List[Finding]:
+    """
+    Run openssl s_client for every (src → tgt) pair.
+    The target port is derived per-node from enable_legacy_ssl_storage_port.
+    """
     pairs = [(s, t) for s in nodes for t in nodes if s.name != t.name]
 
     def _run(pair):
         s, t = pair
         host = t.yaml_data.get("listen_address") or t.host
+        port = _internode_ssl_port(t)   # use the TARGET node's port
         return check_tls_pair(s, host, t.name, port, timeout)
 
     findings = []
@@ -1178,14 +1231,42 @@ def check_logs(node: Node, timeout: int) -> List[Finding]:
 
     # Runtime ports
     ss_out, _ = ssh_run(node, "ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null", timeout)
-    ie = _enc(node).get("internode_encryption", "none")
-    if ie == "all" and ":7000 " in ss_out:
-        findings.append(Finding(node.name, "plaintext_port_open", "WARN",
-                                "Port 7000 (plaintext internode) open with internode_encryption=all.",
-                                "Firewall port 7000 after rolling restart."))
-    if ie != "none" and ":7001 " not in ss_out:
-        findings.append(Finding(node.name, "ssl_port_closed", "WARN",
-                                "Port 7001 (internode SSL) not listening."))
+    ie          = _enc(node).get("internode_encryption", "none")
+    ssl_port    = _internode_ssl_port(node)
+    legacy_ssl  = node.yaml_data.get("enable_legacy_ssl_storage_port", False)
+
+    if ie not in ("none", ""):
+        port_7000_open = ":7000 " in ss_out or ":7000\t" in ss_out
+        port_7001_open = ":7001 " in ss_out or ":7001\t" in ss_out
+
+        if ssl_port == 7000:
+            # SSL multiplexed on 7000 — port 7000 MUST be open, 7001 not needed
+            if not port_7000_open:
+                findings.append(Finding(node.name, "ssl_port_closed", "WARN",
+                                        f"SSL internode port 7000 not listening "
+                                        f"(enable_legacy_ssl_storage_port=false)."))
+            else:
+                findings.append(Finding(node.name, "ssl_port_open", "PASS",
+                                        "SSL internode traffic on port 7000 "
+                                        "(enable_legacy_ssl_storage_port=false) — port is open."))
+            if port_7001_open:
+                findings.append(Finding(node.name, "legacy_ssl_port_open", "INFO",
+                                        "Port 7001 also open alongside port 7000 "
+                                        "(enable_legacy_ssl_storage_port=false)."))
+        else:
+            # Dedicated SSL port 7001
+            if port_7000_open:
+                findings.append(Finding(node.name, "plaintext_port_open", "WARN",
+                                        "Port 7000 (plaintext storage) open — "
+                                        "expected only port 7001 with SSL enabled.",
+                                        "Firewall port 7000 after rolling restart."))
+            if not port_7001_open:
+                findings.append(Finding(node.name, "ssl_port_closed", "WARN",
+                                        "Port 7001 (dedicated SSL storage) not listening "
+                                        "(enable_legacy_ssl_storage_port=true)."))
+            else:
+                findings.append(Finding(node.name, "ssl_port_open", "PASS",
+                                        "SSL internode port 7001 is listening."))
 
     return findings
 
@@ -1410,7 +1491,7 @@ def run(args) -> int:
 
     if "tls" in active and len(reachable) > 1:
         print("\nTLS mesh test (all node pairs)...")
-        all_findings += check_tls_mesh(reachable, 7001, args.timeout, args.threads)
+        all_findings += check_tls_mesh(reachable, args.timeout, args.threads)
 
     if "opscenter" in active and ops_cfg:
         all_findings += check_opscenter(ops_cfg, reachable, args.timeout)

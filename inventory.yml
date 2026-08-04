@@ -2,19 +2,24 @@ cluster_name: MyCluster
 dse_version: "6.8"         # optional — auto-detected if omitted
 
 defaults:
-  # ── SSH login account ──────────────────────────────────────────────────────
-  ssh_user: ubuntu          # account used to open the SSH connection
+  # ── SSH login account ─────────────────────────────────────────────────────
+  # 'automaton' is the account used to open the SSH connection.
+  ssh_user: automaton
   ssh_key:  ~/.ssh/id_rsa
   ssh_port: 22
 
-  # ── DSE OS account (owner of keystores / config files) ────────────────────
-  # Set this when your SSH user (e.g. ubuntu) is different from the user that
-  # owns DSE files (e.g. dse, cassandra).  Leave blank if they are the same.
-  dse_user: dse             # e.g. dse | cassandra | "" (empty = no escalation)
-  use_sudo: true            # true  → sudo -u <dse_user>  (requires NOPASSWD)
-                            # false → su -c (fallback, less common)
+  # ── DSE OS account ────────────────────────────────────────────────────────
+  # 'cassandra' owns the keystore/truststore files, cassandra.yaml, and
+  # all DSE configuration under /etc/dse/.
+  # The tool runs all file reads (keytool, stat, cat) as this user via:
+  #   sudo -u cassandra -n <command>
+  # Requirement on each node:
+  #   automaton ALL=(cassandra) NOPASSWD: ALL
+  #   (or scope it to specific binaries — see README)
+  dse_user: cassandra
+  use_sudo: true            # sudo -u cassandra  (set false to use 'su' instead)
 
-  # ── Remote config paths ────────────────────────────────────────────────────
+  # ── Remote config paths ───────────────────────────────────────────────────
   cassandra_yaml: /etc/dse/cassandra/cassandra.yaml
   ssl_dir:        /etc/dse/ssl
 
@@ -30,13 +35,11 @@ nodes:
   - host: 10.1.1.3
     name: node3
     dc:   dc2
-    # Override per-node if a node has a different OS user
-    # dse_user: cassandra
 
-# ── OpsCenter (optional) ──────────────────────────────────────────────────────
+# ── OpsCenter (optional) ─────────────────────────────────────────────────────
 # opscenter:
 #   host:     10.1.1.10
-#   ssh_user: ubuntu
+#   ssh_user: automaton
 #   ssh_key:  ~/.ssh/id_rsa
-#   dse_user: opscenter     # OpsCenter service user
+#   dse_user: cassandra   # or opscenter if different on OpsCenter host
 #   conf:     /etc/opscenter/opscenterd.conf

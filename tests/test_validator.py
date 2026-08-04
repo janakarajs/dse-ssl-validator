@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from validator import (
     Finding, Node, _worst, _score, _fp, _enc,
-    _as_dse,
+    _as_dse, _internode_ssl_port,
     check_config, check_config_consistency,
     _parse_date, _WEAK_FAIL, _WEAK_WARN,
 )
@@ -86,6 +86,65 @@ def test_node_defaults_dse_user():
     n = Node(name="x", host="h")
     assert n.dse_user == ""
     assert n.use_sudo is True
+
+# ── _internode_ssl_port ───────────────────────────────────────────────────────
+
+def _ssl_node(legacy_ssl_port=None, dse_version="6.8.0") -> Node:
+    n = Node(name="t", host="h")
+    n.dse_version = dse_version
+    if legacy_ssl_port is not None:
+        n.yaml_data = {"enable_legacy_ssl_storage_port": legacy_ssl_port}
+    return n
+
+def test_ssl_port_explicit_false():
+    """enable_legacy_ssl_storage_port: false → port 7000."""
+    assert _internode_ssl_port(_ssl_node(legacy_ssl_port=False)) == 7000
+
+def test_ssl_port_explicit_true():
+    """enable_legacy_ssl_storage_port: true → port 7001."""
+    assert _internode_ssl_port(_ssl_node(legacy_ssl_port=True)) == 7001
+
+def test_ssl_port_absent_dse6():
+    """Key absent, DSE 6.x → default to 7000 (legacy=false default)."""
+    assert _internode_ssl_port(_ssl_node(dse_version="6.8.41")) == 7000
+
+def test_ssl_port_absent_dse5():
+    """Key absent, DSE 5.x → default to 7001 (legacy=true default)."""
+    assert _internode_ssl_port(_ssl_node(dse_version="5.1.20")) == 7001
+
+def test_ssl_port_absent_unknown_version():
+    """Key absent, unknown version → safe default 7001."""
+    assert _internode_ssl_port(_ssl_node(dse_version="unknown")) == 7001
+
+def test_config_records_legacy_ssl_false():
+    """check_config emits INFO finding when enable_legacy_ssl_storage_port=false."""
+    n = Node(name="t", host="h")
+    n.yaml_data = {
+        "enable_legacy_ssl_storage_port": False,
+        "server_encryption_options": {
+            "internode_encryption": "all",
+            "keystore": "/k", "keystore_password": "p",
+            "truststore": "/t", "truststore_password": "p",
+            "protocol": "TLS",
+        }
+    }
+    checks = {f.check for f in check_config(n) if f.status == "INFO"}
+    assert "legacy_ssl_storage_port" in checks
+
+def test_config_records_legacy_ssl_true():
+    """check_config emits INFO finding when enable_legacy_ssl_storage_port=true."""
+    n = Node(name="t", host="h")
+    n.yaml_data = {
+        "enable_legacy_ssl_storage_port": True,
+        "server_encryption_options": {
+            "internode_encryption": "all",
+            "keystore": "/k", "keystore_password": "p",
+            "truststore": "/t", "truststore_password": "p",
+            "protocol": "TLS",
+        }
+    }
+    checks = {f.check for f in check_config(n) if f.status == "INFO"}
+    assert "legacy_ssl_storage_port" in checks
 
 # ── config validation ────────────────────────────────────────────────────────
 
