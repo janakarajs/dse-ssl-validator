@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from validator import (
     Finding, Node, _worst, _score, _fp, _enc,
+    _as_dse,
     check_config, check_config_consistency,
     _parse_date, _WEAK_FAIL, _WEAK_WARN,
 )
@@ -40,6 +41,51 @@ def test_enc_helper():
     assert _enc(n)["keystore"] == "/k"
     n2 = Node(name="y", host="h")
     assert _enc(n2) == {}
+
+# ── split-user / _as_dse ─────────────────────────────────────────────────────
+
+def _node_split(ssh_user="ubuntu", dse_user="dse", use_sudo=True):
+    n = Node(name="t", host="h", ssh_user=ssh_user, dse_user=dse_user,
+             use_sudo=use_sudo)
+    return n
+
+def test_as_dse_no_escalation_same_user():
+    """When ssh_user == dse_user, no wrapping."""
+    n = _node_split(ssh_user="dse", dse_user="dse")
+    assert _as_dse(n, "cat /f") == "cat /f"
+
+def test_as_dse_no_escalation_empty_dse_user():
+    """When dse_user is empty, no wrapping."""
+    n = Node(name="t", host="h", ssh_user="ubuntu", dse_user="")
+    assert _as_dse(n, "cat /f") == "cat /f"
+
+def test_as_dse_sudo():
+    """When users differ and use_sudo=True, wrap with sudo -u."""
+    n = _node_split(ssh_user="ubuntu", dse_user="dse", use_sudo=True)
+    result = _as_dse(n, "cat /etc/dse/ssl/ks.jks")
+    assert result.startswith("sudo -u dse -n ")
+    assert "cat /etc/dse/ssl/ks.jks" in result
+
+def test_as_dse_su_fallback():
+    """When use_sudo=False, fall back to su -s /bin/sh."""
+    n = _node_split(ssh_user="ubuntu", dse_user="dse", use_sudo=False)
+    result = _as_dse(n, "id")
+    assert "su -s /bin/sh" in result
+    assert "dse" in result
+
+def test_as_dse_keytool_wrapped():
+    """Keytool command gets properly wrapped for dse_user."""
+    n = _node_split()
+    cmd = 'keytool -list -keystore /etc/dse/ssl/ks.jks -storepass "pass" -noprompt'
+    result = _as_dse(n, cmd)
+    assert "sudo -u dse -n" in result
+    assert "keytool" in result
+
+def test_node_defaults_dse_user():
+    """Node.dse_user defaults to empty string."""
+    n = Node(name="x", host="h")
+    assert n.dse_user == ""
+    assert n.use_sudo is True
 
 # ── config validation ────────────────────────────────────────────────────────
 

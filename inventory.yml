@@ -2,11 +2,20 @@ cluster_name: MyCluster
 dse_version: "6.8"         # optional — auto-detected if omitted
 
 defaults:
-  ssh_user: ubuntu
+  # ── SSH login account ──────────────────────────────────────────────────────
+  ssh_user: ubuntu          # account used to open the SSH connection
   ssh_key:  ~/.ssh/id_rsa
   ssh_port: 22
+
+  # ── DSE OS account (owner of keystores / config files) ────────────────────
+  # Set this when your SSH user (e.g. ubuntu) is different from the user that
+  # owns DSE files (e.g. dse, cassandra).  Leave blank if they are the same.
+  dse_user: dse             # e.g. dse | cassandra | "" (empty = no escalation)
+  use_sudo: true            # true  → sudo -u <dse_user>  (requires NOPASSWD)
+                            # false → su -c (fallback, less common)
+
+  # ── Remote config paths ────────────────────────────────────────────────────
   cassandra_yaml: /etc/dse/cassandra/cassandra.yaml
-  dse_yaml:       /etc/dse/dse.yaml
   ssl_dir:        /etc/dse/ssl
 
 nodes:
@@ -21,9 +30,13 @@ nodes:
   - host: 10.1.1.3
     name: node3
     dc:   dc2
+    # Override per-node if a node has a different OS user
+    # dse_user: cassandra
 
-# opscenter:                  # uncomment if OpsCenter is deployed
+# ── OpsCenter (optional) ──────────────────────────────────────────────────────
+# opscenter:
 #   host:     10.1.1.10
 #   ssh_user: ubuntu
 #   ssh_key:  ~/.ssh/id_rsa
+#   dse_user: opscenter     # OpsCenter service user
 #   conf:     /etc/opscenter/opscenterd.conf

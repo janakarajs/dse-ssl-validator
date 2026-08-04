@@ -6,6 +6,15 @@ Sequential, gate-based SSL/TLS health checker for DSE clusters.
 Each stage must pass before the next runs. First failure exits with remediation.
 Covers DSE 5.1, 6.7, 6.8, 6.9 / OpsCenter 6.8.
 
+Split-user support
+  SSH user  (e.g. ubuntu/ec2-user) — used for the SSH connection.
+  DSE user  (e.g. dse/cassandra)   — owns keystores, config files.
+  When they differ, the tool automatically uses  sudo -u <dse_user>
+  for file reads and keytool commands, and  sudo cat  for SCP fallback.
+  Set  dse_user  in inventory.yml defaults or per-node.
+  Set  use_sudo: true  if passwordless sudo is available (default: true
+  when dse_user is set).
+
 Validation order per node:
   1. config   — cassandra.yaml paths, passwords, protocol
   2. cert     — keystore path exists, expiry, key size, signature alg
@@ -72,10 +81,14 @@ class Node:
     host:  str
     dc:    str = ""
     rack:  str = ""
-    # SSH
+    # SSH login user (e.g. ubuntu, ec2-user)
     ssh_user: str = "ubuntu"
     ssh_key:  str = ""
     ssh_port: int = 22
+    # DSE OS user that owns config/keystore files (e.g. dse, cassandra)
+    # Leave empty when ssh_user == DSE user (no privilege escalation needed)
+    dse_user:  str  = ""
+    use_sudo:  bool = True   # use sudo -u <dse_user>; set False for su fallback
     # Remote paths
     cassandra_yaml: str = "/etc/dse/cassandra/cassandra.yaml"
     ssl_dir:        str = "/etc/dse/ssl"
@@ -87,10 +100,11 @@ class Node:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SSH helpers
+# SSH helpers  (split-user aware)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ssh_base(node: Node, timeout: int) -> List[str]:
+    """Build base ssh command for the SSH login user."""
     base = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
@@ -104,15 +118,38 @@ def _ssh_base(node: Node, timeout: int) -> List[str]:
     return base
 
 
-def ssh_run(node: Node, cmd: str, timeout: int = 10) -> Tuple[str, int]:
-    """Run cmd on node. Returns (stdout+stderr, exit_code)."""
+def _as_dse(node: Node, cmd: str) -> str:
+    """
+    Wrap cmd so it runs as the DSE OS user when ssh_user != dse_user.
+    Uses  sudo -u <dse_user> -n  (non-interactive, requires NOPASSWD sudo).
+    Falls back gracefully — if dse_user is empty or same as ssh_user, no wrapping.
+    """
+    if not node.dse_user or node.dse_user == node.ssh_user:
+        return cmd
+    if node.use_sudo:
+        return f"sudo -u {node.dse_user} -n {cmd}"
+    # su fallback (less common but works when sudo not available)
+    return f"su -s /bin/sh -c {repr(cmd)} {node.dse_user}"
+
+
+def ssh_run(node: Node, cmd: str, timeout: int = 10,
+            as_dse: bool = False) -> Tuple[str, int]:
+    """
+    Run cmd on node via SSH.
+    as_dse=True  →  run as node.dse_user (via sudo/su) if different from ssh_user.
+    Returns (stdout+stderr, exit_code).
+    """
+    effective = _as_dse(node, cmd) if as_dse else cmd
     try:
         r = subprocess.run(
-            _ssh_base(node, timeout) + [cmd],
+            _ssh_base(node, timeout) + [effective],
             capture_output=True, text=True, timeout=timeout + 5,
         )
         out = r.stdout + r.stderr
-        log.debug("[%s] $ %s  →  rc=%d  %s", node.name, cmd[:80], r.returncode, out[:120])
+        log.debug("[%s%s] $ %s  →  rc=%d  %s",
+                  node.name,
+                  f"(as {node.dse_user})" if as_dse and node.dse_user else "",
+                  cmd[:80], r.returncode, out[:120])
         return out, r.returncode
     except subprocess.TimeoutExpired:
         return f"TIMEOUT after {timeout}s", -1
@@ -121,20 +158,45 @@ def ssh_run(node: Node, cmd: str, timeout: int = 10) -> Tuple[str, int]:
 
 
 def ssh_get(node: Node, remote: str, local: str, timeout: int = 30) -> bool:
-    """SCP a single file from node to local path."""
-    cmd = [
+    """
+    Copy remote file to local path.
+    Strategy:
+      1. Direct SCP  (works when ssh_user can read the file)
+      2. Fallback: sudo cat via SSH pipe  (when dse_user owns the file)
+    """
+    # Strategy 1: direct SCP
+    scp = [
         "scp", "-q",
         "-o", "StrictHostKeyChecking=no",
         "-o", "BatchMode=yes",
         "-P", str(node.ssh_port),
     ]
     if node.ssh_key:
-        cmd += ["-i", os.path.expanduser(node.ssh_key)]
-    cmd += [f"{node.ssh_user}@{node.host}:{remote}", local]
+        scp += ["-i", os.path.expanduser(node.ssh_key)]
+    scp += [f"{node.ssh_user}@{node.host}:{remote}", local]
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=timeout).returncode == 0
+        if subprocess.run(scp, capture_output=True, timeout=timeout).returncode == 0:
+            return True
     except Exception:
-        return False
+        pass
+
+    # Strategy 2: sudo cat (when file is owned by dse_user)
+    if node.dse_user and node.dse_user != node.ssh_user:
+        cat_cmd = _as_dse(node, f"cat {remote}")
+        try:
+            r = subprocess.run(
+                _ssh_base(node, timeout) + [cat_cmd],
+                capture_output=True, timeout=timeout,
+            )
+            if r.returncode == 0 and r.stdout:
+                with open(local, "wb") as fh:
+                    fh.write(r.stdout)
+                log.debug("[%s] ssh_get via sudo cat: %s → %s", node.name, remote, local)
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,14 +213,18 @@ def load_inventory(path: str) -> Tuple[List[Node], dict, dict]:
 
     nodes = []
     for nc in inv.get("nodes", []):
+        ssh_user = nc.get("ssh_user", _d("ssh_user", "ubuntu"))
+        dse_user = nc.get("dse_user", _d("dse_user", ""))
         nodes.append(Node(
             name         = nc.get("name", nc.get("host")),
             host         = nc["host"],
             dc           = nc.get("dc", ""),
             rack         = nc.get("rack", ""),
-            ssh_user     = nc.get("ssh_user",     _d("ssh_user",     "ubuntu")),
-            ssh_key      = nc.get("ssh_key",      _d("ssh_key",      "")),
-            ssh_port     = int(nc.get("ssh_port", _d("ssh_port",     22))),
+            ssh_user     = ssh_user,
+            ssh_key      = nc.get("ssh_key",      _d("ssh_key",  "")),
+            ssh_port     = int(nc.get("ssh_port", _d("ssh_port", 22))),
+            dse_user     = dse_user,
+            use_sudo     = bool(nc.get("use_sudo", _d("use_sudo", True))),
             cassandra_yaml = nc.get("cassandra_yaml",
                                     _d("cassandra_yaml", "/etc/dse/cassandra/cassandra.yaml")),
             ssl_dir      = nc.get("ssl_dir", _d("ssl_dir", "/etc/dse/ssl")),
@@ -174,20 +240,45 @@ def collect(node: Node, work_dir: str, timeout: int) -> Optional[Finding]:
     """
     Populate node.yaml_data, dse_version, java_version, proc_start.
     Returns a FAIL Finding on SSH/parse error (caller should skip node), else None.
+
+    Split-user handling:
+      - SSH connectivity tested as ssh_user
+      - cassandra.yaml downloaded via ssh_get (tries SCP, then sudo cat)
+      - dse/java version and process info run as ssh_user first,
+        falling back to dse_user if dse_user is set
     """
-    # SSH reachability
+    # ── SSH reachability (as ssh_user) ────────────────────────────────────────
     out, rc = ssh_run(node, "echo ok", timeout)
     if rc != 0 or "ok" not in out:
         return Finding(node.name, "ssh_connect", "FAIL",
-                       f"Cannot SSH to {node.host}:{node.ssh_port}.",
+                       f"Cannot SSH to {node.host}:{node.ssh_port} as {node.ssh_user}.",
                        "Check SSH key, username, and firewall.")
 
-    # cassandra.yaml
+    # ── Verify sudo access when dse_user is configured ───────────────────────
+    if node.dse_user and node.dse_user != node.ssh_user:
+        probe = f"sudo -u {node.dse_user} -n id 2>&1" if node.use_sudo \
+                else f"su -s /bin/sh -c id {node.dse_user} 2>&1"
+        out_sudo, rc_sudo = ssh_run(node, probe, timeout)
+        if rc_sudo != 0 or node.dse_user not in out_sudo:
+            return Finding(
+                node.name, "sudo_access", "FAIL",
+                f"ssh_user='{node.ssh_user}' cannot run commands as dse_user='{node.dse_user}'."
+                f"  Output: {out_sudo.strip()[:120]}",
+                f"Add NOPASSWD sudo rule:  {node.ssh_user} ALL=(ALL) NOPASSWD: ALL"
+                f"  or grant {node.ssh_user} membership in the {node.dse_user} group.",
+            )
+        log.info("[%s] sudo access confirmed: %s → %s", node.name,
+                 node.ssh_user, node.dse_user)
+
+    # ── cassandra.yaml (may be owned by dse_user) ────────────────────────────
     local = os.path.join(work_dir, f"{node.name}_cassandra.yaml")
     if not ssh_get(node, node.cassandra_yaml, local, timeout):
+        hint = (f"  File may be owned by {node.dse_user}; "
+                f"set dse_user in inventory.yml so the tool uses sudo cat."
+                if not node.dse_user else "")
         return Finding(node.name, "cassandra_yaml_missing", "FAIL",
-                       f"{node.cassandra_yaml} not found or unreadable.",
-                       "Verify cassandra_yaml path in inventory.yml and SSH user permissions.")
+                       f"{node.cassandra_yaml} not found or unreadable.{hint}",
+                       "Verify cassandra_yaml path and set dse_user in inventory.yml.")
     try:
         with open(local) as fh:
             node.yaml_data = yaml.safe_load(fh) or {}
@@ -195,16 +286,15 @@ def collect(node: Node, work_dir: str, timeout: int) -> Optional[Finding]:
         return Finding(node.name, "cassandra_yaml_parse", "FAIL",
                        f"Failed to parse cassandra.yaml: {exc}")
 
-    # DSE version
-    out, _ = ssh_run(node, "dse -v 2>/dev/null || true", timeout)
+    # ── DSE + Java version (run as dse_user if available) ────────────────────
+    out, _ = ssh_run(node, "dse -v 2>/dev/null || true", timeout, as_dse=True)
     node.dse_version = out.strip().split()[-1] if out.strip() else "unknown"
 
-    # Java version
-    out, _ = ssh_run(node, "java -version 2>&1 | head -1", timeout)
+    out, _ = ssh_run(node, "java -version 2>&1 | head -1", timeout, as_dse=True)
     m = re.search(r'version "([^"]+)"', out)
     node.java_version = m.group(1) if m else out.strip()[:40]
 
-    # DSE process start epoch (for restart detection)
+    # ── DSE process start epoch (as ssh_user; /proc is world-readable) ───────
     out, _ = ssh_run(node,
         "stat -c '%Y' /proc/$(pgrep -f CassandraDaemon 2>/dev/null | head -1)/exe 2>/dev/null || echo 0",
         timeout)
@@ -344,26 +434,27 @@ def check_cert(node: Node, warn_days: int, fail_days: int, timeout: int) -> List
     ks    = enc.get("keystore", "")
     pwd   = enc.get("keystore_password", "")
 
-    # ── 2a. File exists on node ──────────────────────────────────────────────
-    out, rc = ssh_run(node, f"test -f {ks} && echo EXISTS || echo MISSING", timeout)
+    # ── 2a. File exists on node (as dse_user if set) ─────────────────────────
+    out, rc = ssh_run(node, f"test -f {ks} && echo EXISTS || echo MISSING",
+                      timeout, as_dse=True)
     if "MISSING" in out:
         return [Finding(node.name, "keystore_file", "FAIL",
                         f"Keystore not found at {ks}.",
                         "Check server_encryption_options.keystore path in cassandra.yaml.")]
 
-    # ── 2b. Password correct ─────────────────────────────────────────────────
+    # ── 2b. Password correct (as dse_user) ───────────────────────────────────
     out, rc = ssh_run(node,
         f'keytool -list -keystore {ks} -storepass "{pwd}" -noprompt 2>&1 | head -3',
-        timeout)
+        timeout, as_dse=True)
     if "tampered" in out.lower() or "incorrect" in out.lower() or rc != 0:
         return [Finding(node.name, "keystore_password", "FAIL",
                         "Keystore password is wrong or the keystore is corrupt.",
                         "Correct keystore_password in cassandra.yaml, or re-create the keystore.")]
 
-    # ── 2c. Full keytool -list -v ────────────────────────────────────────────
+    # ── 2c. Full keytool -list -v (as dse_user) ──────────────────────────────
     kt_out, _ = ssh_run(node,
         f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
-        timeout)
+        timeout, as_dse=True)
 
     # Entry type must be PrivateKeyEntry
     if "trustedCertEntry" in kt_out and "PrivateKeyEntry" not in kt_out:
@@ -438,10 +529,10 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         return [Finding(node.name, "chain_check", "SKIP",
                         "Missing keystore/truststore config — chain check skipped.")]
 
-    # ── 3a. Chain depth from keytool ─────────────────────────────────────────
+    # ── 3a. Chain depth from keytool (as dse_user) ───────────────────────────
     kt_out, _ = ssh_run(node,
         f'keytool -list -v -keystore {ks} -storepass "{kspw}" -noprompt 2>&1',
-        timeout)
+        timeout, as_dse=True)
 
     # Count "Certificate[N]" markers; fall back to PEM header count
     depth = len(re.findall(r"Certificate\[\d+\]", kt_out))
@@ -460,23 +551,23 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         findings.append(Finding(node.name, "chain_depth", "INFO",
                                 f"Certificate chain depth: {depth} (leaf + {depth-1} CA(s))."))
 
-    # ── 3b. Export leaf cert from keystore ───────────────────────────────────
+    # ── 3b. Export leaf cert from keystore (as dse_user) ─────────────────────
     tmp_leaf = f"/tmp/_dse_leaf_{node.name}.pem"
     _, rc = ssh_run(node,
         f'keytool -exportcert -alias cassandra -keystore {ks} '
         f'-storepass "{kspw}" -rfc -file {tmp_leaf} 2>/dev/null',
-        timeout)
+        timeout, as_dse=True)
     if rc != 0:
         findings.append(Finding(node.name, "chain_export", "WARN",
                                 "Could not export leaf cert from keystore (alias 'cassandra' missing?)",
                                 "Check that the alias in server_encryption_options.keystore is 'cassandra'."))
         return findings
 
-    # ── 3c. Export all truststore CAs ────────────────────────────────────────
+    # ── 3c. Export all truststore CAs (as dse_user) ──────────────────────────
     alias_out, _ = ssh_run(node,
         f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1 '
         f'| grep "Alias name:" | sed "s/.*: //"',
-        timeout)
+        timeout, as_dse=True)
     aliases = [a.strip() for a in alias_out.splitlines() if a.strip()]
 
     if not aliases:
@@ -495,11 +586,11 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         pem, rc = ssh_run(node,
             f'keytool -exportcert -alias "{alias}" -keystore {ts} '
             f'-storepass "{tspw}" -rfc 2>/dev/null',
-            timeout)
+            timeout, as_dse=True)
         if "BEGIN CERTIFICATE" not in pem:
             continue
 
-        # Write to temp to inspect with openssl
+        # Write to temp to inspect with openssl (no dse perms needed for tmp files)
         tmp_ca = f"/tmp/_dse_ca_{node.name}_{alias}.pem"
         ssh_run(node, f"cat > {tmp_ca} << 'ENDPEM'\n{pem}\nENDPEM", timeout)
 
@@ -604,10 +695,10 @@ def check_trust(node: Node, timeout: int) -> List[Finding]:
         return [Finding(node.name, "trust_check", "SKIP",
                         "Truststore config missing — trust check skipped.")]
 
-    # Truststore password
+    # Truststore password (as dse_user)
     out, rc = ssh_run(node,
         f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1 | head -3',
-        timeout)
+        timeout, as_dse=True)
     if "tampered" in out.lower() or "incorrect" in out.lower() or rc != 0:
         return [Finding(node.name, "truststore_password", "FAIL",
                         "Truststore password wrong or store corrupt.",
@@ -615,10 +706,9 @@ def check_trust(node: Node, timeout: int) -> List[Finding]:
 
     # Must contain at least one trustedCertEntry
     if "trustedCertEntry" not in out:
-        # list without -v for count
         full_out, _ = ssh_run(node,
             f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1',
-            timeout)
+            timeout, as_dse=True)
         if "trustedCertEntry" not in full_out:
             return [Finding(node.name, "truststore_empty", "FAIL",
                             "Truststore contains no trustedCertEntry.",
@@ -735,7 +825,7 @@ def check_cert_match(node: Node, port: int, timeout: int) -> List[Finding]:
     tmp = f"/tmp/_dse_cm_{node.name}.pem"
     ssh_run(node,
         f'keytool -exportcert -alias cassandra -keystore {ks} '
-        f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout)
+        f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout, as_dse=True)
     ks_fp_out, _  = ssh_run(node,
         f"openssl x509 -noout -fingerprint -sha256 -in {tmp} 2>/dev/null", timeout)
     ssh_run(node, f"rm -f {tmp}", timeout)
@@ -776,7 +866,7 @@ def check_hostname(node: Node, timeout: int) -> List[Finding]:
     tmp = f"/tmp/_dse_hn_{node.name}.pem"
     ssh_run(node,
         f'keytool -exportcert -alias cassandra -keystore {ks} '
-        f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout)
+        f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout, as_dse=True)
     san_out, _ = ssh_run(node,
         f"openssl x509 -noout -subject -ext subjectAltName -in {tmp} 2>/dev/null", timeout)
     ssh_run(node, f"rm -f {tmp}", timeout)
@@ -1008,7 +1098,9 @@ def check_restart(node: Node, timeout: int) -> List[Finding]:
                         ("truststore", _enc(node).get("truststore", ""))):
         if not path:
             continue
-        out, _ = ssh_run(node, f"stat -c '%Y' {path} 2>/dev/null || echo 0", timeout)
+        # stat needs dse_user perms when files are owned by dse/cassandra
+        out, _ = ssh_run(node, f"stat -c '%Y' {path} 2>/dev/null || echo 0",
+                         timeout, as_dse=True)
         try:
             mtime = int(out.strip())
         except ValueError:
