@@ -2,13 +2,25 @@
 """
 DSE SSL Validator
 -----------------
-Lightweight, single-file SSL/TLS health checker for DSE clusters.
+Sequential, gate-based SSL/TLS health checker for DSE clusters.
+Each stage must pass before the next runs. First failure exits with remediation.
 Covers DSE 5.1, 6.7, 6.8, 6.9 / OpsCenter 6.8.
 
-Usage:
-    python validator.py --inventory inventory.yml
-    python validator.py --inventory inventory.yml --modules cert,trust,tls
-    python validator.py --inventory inventory.yml --nodes node1,node2
+Validation order per node:
+  1. config   — cassandra.yaml paths, passwords, protocol
+  2. cert     — keystore path exists, expiry, key size, signature alg
+  3. chain    — root + intermediate CA chain length, openssl verify
+  4. trust    — truststore populated, cross-node CA coverage
+  5. tls      — live openssl s_client mesh (N×N-1)
+  6. match    — keystore fingerprint vs live cert (restart detection)
+  7. hostname — SAN/CN vs listen_address, broadcast_address, hostname
+  8. jmx      — port 7199 TLS
+  9. native   — port 9042/9142 TLS
+ 10. opscenter— opscenterd.conf, agent ports 61620/61621
+ 11. ciphers  — weak/broken cipher detection
+ 12. versions — Java/TLS version matrix
+ 13. restart  — keystore mtime vs DSE process start
+ 14. logs     — system.log SSL errors, clock skew, runtime ports
 
 Requirements: PyYAML  (pip install pyyaml)
 Target nodes: openssl, keytool, ss/nc, stat, grep — standard on any DSE host.
@@ -22,17 +34,20 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 try:
     import yaml
 except ImportError:
     sys.exit("PyYAML not installed. Run: pip install pyyaml")
+
+log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data types
@@ -40,11 +55,11 @@ except ImportError:
 
 @dataclass
 class Finding:
-    node:        str
-    check:       str
-    status:      str   # PASS | WARN | FAIL | INFO | SKIP
-    detail:      str
-    fix:         str = ""
+    node:   str
+    check:  str
+    status: str    # PASS | WARN | FAIL | INFO | SKIP
+    detail: str
+    fix:    str = ""
 
     def as_dict(self):
         return {"node": self.node, "check": self.check,
@@ -53,35 +68,32 @@ class Finding:
 
 @dataclass
 class Node:
-    name:   str
-    host:   str
-    dc:     str = ""
-    rack:   str = ""
-    # SSH config
+    name:  str
+    host:  str
+    dc:    str = ""
+    rack:  str = ""
+    # SSH
     ssh_user: str = "ubuntu"
     ssh_key:  str = ""
     ssh_port: int = 22
-    # Remote config paths
+    # Remote paths
     cassandra_yaml: str = "/etc/dse/cassandra/cassandra.yaml"
-    dse_yaml:       str = "/etc/dse/dse.yaml"
-    cassandra_env:  str = "/etc/dse/cassandra/cassandra-env.sh"
-    jvm_options:    str = "/etc/dse/cassandra/jvm.options"
     ssl_dir:        str = "/etc/dse/ssl"
-    # Collected at runtime
-    yaml_data:   dict = field(default_factory=dict)
-    dse_version: str  = ""
-    java_version: str = ""
-    proc_start:  int  = 0
+    # Populated at runtime
+    yaml_data:    dict = field(default_factory=dict)
+    dse_version:  str  = ""
+    java_version: str  = ""
+    proc_start:   int  = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SSH helper — thin subprocess wrapper around the system ssh binary
+# SSH helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ssh_run(node: Node, cmd: str, timeout: int = 10) -> Tuple[str, int]:
-    """Run cmd on node via ssh. Returns (stdout+stderr, exit_code)."""
+def _ssh_base(node: Node, timeout: int) -> List[str]:
     base = [
-        "ssh", "-o", "StrictHostKeyChecking=no",
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
         "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={timeout}",
         "-p", str(node.ssh_port),
@@ -89,22 +101,27 @@ def ssh_run(node: Node, cmd: str, timeout: int = 10) -> Tuple[str, int]:
     if node.ssh_key:
         base += ["-i", os.path.expanduser(node.ssh_key)]
     base.append(f"{node.ssh_user}@{node.host}")
-    base.append(cmd)
+    return base
 
-    logging.debug("[%s] $ %s", node.name, cmd)
+
+def ssh_run(node: Node, cmd: str, timeout: int = 10) -> Tuple[str, int]:
+    """Run cmd on node. Returns (stdout+stderr, exit_code)."""
     try:
-        r = subprocess.run(base, capture_output=True, text=True, timeout=timeout + 5)
+        r = subprocess.run(
+            _ssh_base(node, timeout) + [cmd],
+            capture_output=True, text=True, timeout=timeout + 5,
+        )
         out = r.stdout + r.stderr
-        logging.debug("[%s] rc=%d out=%s", node.name, r.returncode, out[:200])
+        log.debug("[%s] $ %s  →  rc=%d  %s", node.name, cmd[:80], r.returncode, out[:120])
         return out, r.returncode
     except subprocess.TimeoutExpired:
         return f"TIMEOUT after {timeout}s", -1
-    except Exception as e:
-        return str(e), -1
+    except Exception as exc:
+        return str(exc), -1
 
 
-def ssh_get(node: Node, remote: str, local: str) -> bool:
-    """SCP remote → local. Returns True on success."""
+def ssh_get(node: Node, remote: str, local: str, timeout: int = 30) -> bool:
+    """SCP a single file from node to local path."""
     cmd = [
         "scp", "-q",
         "-o", "StrictHostKeyChecking=no",
@@ -115,8 +132,7 @@ def ssh_get(node: Node, remote: str, local: str) -> bool:
         cmd += ["-i", os.path.expanduser(node.ssh_key)]
     cmd += [f"{node.ssh_user}@{node.host}:{remote}", local]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=30)
-        return r.returncode == 0
+        return subprocess.run(cmd, capture_output=True, timeout=timeout).returncode == 0
     except Exception:
         return False
 
@@ -126,70 +142,58 @@ def ssh_get(node: Node, remote: str, local: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_inventory(path: str) -> Tuple[List[Node], dict, dict]:
-    """Parse inventory.yml. Returns (nodes, opscenter_cfg, raw_inv)."""
+    """Parse inventory.yml → (nodes, opscenter_cfg, raw_inv)."""
     with open(path) as fh:
         inv = yaml.safe_load(fh)
 
-    defaults = inv.get("defaults", {})
-
     def _d(key, fallback=""):
-        return defaults.get(key, fallback)
+        return inv.get("defaults", {}).get(key, fallback)
 
     nodes = []
     for nc in inv.get("nodes", []):
-        n = Node(
-            name=nc.get("name", nc.get("host")),
-            host=nc.get("host"),
-            dc=nc.get("dc", ""),
-            rack=nc.get("rack", ""),
-            ssh_user=nc.get("ssh_user",     _d("ssh_user", "ubuntu")),
-            ssh_key =nc.get("ssh_key",      _d("ssh_key",  "")),
-            ssh_port=int(nc.get("ssh_port", _d("ssh_port", 22))),
-            cassandra_yaml=nc.get("cassandra_yaml", _d("cassandra_yaml",
-                                  "/etc/dse/cassandra/cassandra.yaml")),
-            dse_yaml      =nc.get("dse_yaml",       _d("dse_yaml",
-                                  "/etc/dse/dse.yaml")),
-            cassandra_env =nc.get("cassandra_env",  _d("cassandra_env",
-                                  "/etc/dse/cassandra/cassandra-env.sh")),
-            jvm_options   =nc.get("jvm_options",    _d("jvm_options",
-                                  "/etc/dse/cassandra/jvm.options")),
-            ssl_dir       =nc.get("ssl_dir",        _d("ssl_dir",
-                                  "/etc/dse/ssl")),
-        )
-        nodes.append(n)
-
+        nodes.append(Node(
+            name         = nc.get("name", nc.get("host")),
+            host         = nc["host"],
+            dc           = nc.get("dc", ""),
+            rack         = nc.get("rack", ""),
+            ssh_user     = nc.get("ssh_user",     _d("ssh_user",     "ubuntu")),
+            ssh_key      = nc.get("ssh_key",      _d("ssh_key",      "")),
+            ssh_port     = int(nc.get("ssh_port", _d("ssh_port",     22))),
+            cassandra_yaml = nc.get("cassandra_yaml",
+                                    _d("cassandra_yaml", "/etc/dse/cassandra/cassandra.yaml")),
+            ssl_dir      = nc.get("ssl_dir", _d("ssl_dir", "/etc/dse/ssl")),
+        ))
     return nodes, inv.get("opscenter", {}), inv
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Collector — fetch cassandra.yaml + metadata per node
+# Collector — SSH probe + cassandra.yaml download
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collect(node: Node, work_dir: str, timeout: int) -> List[Finding]:
-    """Download cassandra.yaml; populate node.yaml_data, dse_version, etc."""
-    findings = []
-
+def collect(node: Node, work_dir: str, timeout: int) -> Optional[Finding]:
+    """
+    Populate node.yaml_data, dse_version, java_version, proc_start.
+    Returns a FAIL Finding on SSH/parse error (caller should skip node), else None.
+    """
     # SSH reachability
     out, rc = ssh_run(node, "echo ok", timeout)
     if rc != 0 or "ok" not in out:
-        findings.append(Finding(node.name, "ssh_connect", "FAIL",
-                                f"SSH to {node.host}:{node.ssh_port} failed.",
-                                "Check SSH credentials and host reachability."))
-        return findings
+        return Finding(node.name, "ssh_connect", "FAIL",
+                       f"Cannot SSH to {node.host}:{node.ssh_port}.",
+                       "Check SSH key, username, and firewall.")
 
     # cassandra.yaml
-    local_yaml = os.path.join(work_dir, f"{node.name}_cassandra.yaml")
-    if ssh_get(node, node.cassandra_yaml, local_yaml):
-        try:
-            with open(local_yaml) as fh:
-                node.yaml_data = yaml.safe_load(fh) or {}
-        except Exception as e:
-            findings.append(Finding(node.name, "parse_cassandra_yaml", "FAIL",
-                                    f"Parse error: {e}"))
-    else:
-        findings.append(Finding(node.name, "missing_cassandra_yaml", "FAIL",
-                                f"{node.cassandra_yaml} not found.",
-                                "Verify path and SSH user permissions."))
+    local = os.path.join(work_dir, f"{node.name}_cassandra.yaml")
+    if not ssh_get(node, node.cassandra_yaml, local, timeout):
+        return Finding(node.name, "cassandra_yaml_missing", "FAIL",
+                       f"{node.cassandra_yaml} not found or unreadable.",
+                       "Verify cassandra_yaml path in inventory.yml and SSH user permissions.")
+    try:
+        with open(local) as fh:
+            node.yaml_data = yaml.safe_load(fh) or {}
+    except Exception as exc:
+        return Finding(node.name, "cassandra_yaml_parse", "FAIL",
+                       f"Failed to parse cassandra.yaml: {exc}")
 
     # DSE version
     out, _ = ssh_run(node, "dse -v 2>/dev/null || true", timeout)
@@ -200,334 +204,499 @@ def collect(node: Node, work_dir: str, timeout: int) -> List[Finding]:
     m = re.search(r'version "([^"]+)"', out)
     node.java_version = m.group(1) if m else out.strip()[:40]
 
-    # Process start epoch
+    # DSE process start epoch (for restart detection)
     out, _ = ssh_run(node,
-        "stat -c '%Y' /proc/$(pgrep -f CassandraDaemon)/exe 2>/dev/null || echo 0",
+        "stat -c '%Y' /proc/$(pgrep -f CassandraDaemon 2>/dev/null | head -1)/exe 2>/dev/null || echo 0",
         timeout)
     try:
         node.proc_start = int(out.strip())
     except ValueError:
         node.proc_start = 0
 
-    return findings
+    return None   # success
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 1 — Config Validation
+# Helpers shared across modules
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEPRECATED_PROTOCOLS = {"SSLV2", "SSLV3", "TLSV1", "TLSV1.1"}
-
-def check_config(node: Node) -> List[Finding]:
-    findings = []
-    enc = node.yaml_data.get("server_encryption_options") or {}
-
-    if not enc:
-        return [Finding(node.name, "server_encryption_options", "WARN",
-                        "server_encryption_options not found in cassandra.yaml.")]
-
-    # internode_encryption
-    ie = enc.get("internode_encryption", "none")
-    findings.append(Finding(node.name, "internode_encryption", "INFO",
-                            f"internode_encryption={ie}"))
-
-    # required fields
-    for fld, sev in [("keystore", "FAIL"), ("truststore", "FAIL"),
-                     ("keystore_password", "FAIL"), ("truststore_password", "FAIL")]:
-        if not enc.get(fld):
-            findings.append(Finding(node.name, f"server_{fld}", sev,
-                                    f"server_encryption_options.{fld} is blank/missing.",
-                                    f"Set {fld} in cassandra.yaml."))
-
-    # protocol
-    proto = enc.get("protocol", "")
-    if proto.upper() in DEPRECATED_PROTOCOLS:
-        findings.append(Finding(node.name, "deprecated_protocol", "FAIL",
-                                f"Deprecated protocol: {proto}",
-                                "Set protocol: TLS in server_encryption_options."))
-
-    # optional flag
-    if enc.get("optional", False):
-        findings.append(Finding(node.name, "server_optional", "WARN",
-                                "server_encryption_options.optional=true allows plaintext.",
-                                "Set optional: false in production."))
-
-    # cipher_suites
-    if not (enc.get("cipher_suites") or []):
-        findings.append(Finding(node.name, "cipher_suites_empty", "WARN",
-                                "cipher_suites not set; JVM defaults used.",
-                                "Set cipher_suites explicitly."))
-
-    # client_encryption_options
-    cenc = node.yaml_data.get("client_encryption_options") or {}
-    if cenc.get("optional"):
-        findings.append(Finding(node.name, "client_optional", "WARN",
-                                "client_encryption_options.optional=true.",
-                                "Set optional: false."))
-
-    return findings
+def _enc(node: Node) -> dict:
+    return node.yaml_data.get("server_encryption_options") or {}
 
 
-def check_config_consistency(nodes: List[Node]) -> List[Finding]:
-    """Cross-node consistency for internode_encryption, protocol, require_client_auth."""
-    findings = []
-    for fld in ("internode_encryption", "protocol",
-                "require_client_auth", "require_endpoint_verification"):
-        vals = {}
-        for n in nodes:
-            enc = n.yaml_data.get("server_encryption_options") or {}
-            vals[n.name] = enc.get(fld, "__unset__")
-        if len(set(str(v) for v in vals.values())) > 1:
-            detail = "  ".join(f"{k}={v}" for k, v in vals.items())
-            findings.append(Finding("cluster", f"inconsistent_{fld}", "FAIL",
-                                    f"{fld} differs across nodes: {detail}",
-                                    f"Set identical {fld} on all nodes then rolling restart."))
-
-    # cipher intersection
-    cipher_sets = []
-    for n in nodes:
-        enc = n.yaml_data.get("server_encryption_options") or {}
-        c = enc.get("cipher_suites") or []
-        if c:
-            cipher_sets.append(set(c))
-    if len(cipher_sets) > 1:
-        inter = cipher_sets[0].intersection(*cipher_sets[1:])
-        if not inter:
-            findings.append(Finding("cluster", "cipher_suites_disjoint", "FAIL",
-                                    "No common cipher suites across nodes.",
-                                    "Align cipher_suites on all nodes."))
-
-    return findings
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Module 2 — Certificate Validation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_cert(node: Node, warn_days: int, fail_days: int,
-               timeout: int) -> List[Finding]:
-    findings = []
-    enc = node.yaml_data.get("server_encryption_options") or {}
-    ks  = enc.get("keystore", "")
-    pwd = enc.get("keystore_password", "")
-    if not ks or not pwd:
-        return [Finding(node.name, "cert_check", "SKIP",
-                        "Keystore path or password missing; skipping cert checks.")]
-
-    # Password check
-    out, rc = ssh_run(node,
-        f'keytool -list -keystore {ks} -storepass "{pwd}" -noprompt 2>&1 | head -5',
-        timeout)
-    if "tampered" in out.lower() or "incorrect" in out.lower():
-        findings.append(Finding(node.name, "keystore_password", "FAIL",
-                                "Keystore password incorrect or store corrupt.",
-                                "Fix keystore_password in cassandra.yaml."))
-        return findings
-
-    # Full keytool -list -v
-    out, rc = ssh_run(node,
-        f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
-        timeout)
-
-    # Entry type
-    if "trustedCertEntry" in out and "PrivateKeyEntry" not in out:
-        findings.append(Finding(node.name, "wrong_entry_type", "FAIL",
-                                "Keystore contains trustedCertEntry, not PrivateKeyEntry.",
-                                "Import the node's private key/cert pair into the keystore."))
-
-    # Expiry
-    m = re.search(r"Valid from:.*?until:\s*(.+)", out)
-    if m:
-        not_after = _parse_keytool_date(m.group(1).strip())
-        if not_after:
-            days = (not_after - datetime.datetime.utcnow()
-                    .replace(tzinfo=datetime.timezone.utc)).days
-            status = "FAIL" if days < fail_days else "WARN" if days < warn_days else "PASS"
-            findings.append(Finding(node.name, "certificate_expiry", status,
-                                    f"Certificate expires in {days} days "
-                                    f"({not_after.strftime('%Y-%m-%d')}).",
-                                    "Renew certificate and restart DSE." if status != "PASS" else ""))
-
-    # Not yet valid
-    m2 = re.search(r"Valid from:\s*(.+?) until:", out)
-    if m2:
-        not_before = _parse_keytool_date(m2.group(1).strip())
-        if not_before and not_before > datetime.datetime.utcnow().replace(
-                tzinfo=datetime.timezone.utc):
-            findings.append(Finding(node.name, "cert_not_yet_valid", "FAIL",
-                                    f"Certificate not yet valid (notBefore={not_before.date()}).",
-                                    "Check certificate dates and system clock."))
-
-    # Signature algorithm
-    m3 = re.search(r"Signature algorithm name:\s*(.+)", out)
-    if m3:
-        sig = m3.group(1).strip().lower()
-        if any(w in sig for w in ("md5", "sha1withrsa", "md2")):
-            findings.append(Finding(node.name, "weak_signature_alg", "FAIL",
-                                    f"Weak signature algorithm: {m3.group(1).strip()}",
-                                    "Replace with SHA-256+ signed certificate."))
-
-    # Key size
-    m4 = re.search(r"(\d+)-bit", out)
-    if m4:
-        sz = int(m4.group(1))
-        if sz < 2048:
-            findings.append(Finding(node.name, "key_size", "FAIL",
-                                    f"Key size {sz} bits is below 2048.",
-                                    "Replace with ≥2048-bit key."))
-        elif sz < 4096:
-            findings.append(Finding(node.name, "key_size", "WARN",
-                                    f"Key size {sz} bits; consider 4096 for longevity."))
-
-    return findings
-
-
-def _parse_keytool_date(text: str) -> Optional[datetime.datetime]:
+def _parse_date(text: str) -> Optional[datetime.datetime]:
     for fmt in ("%a %b %d %H:%M:%S %Z %Y", "%a %b %d %H:%M:%S %Y", "%B %d, %Y"):
         try:
-            return datetime.datetime.strptime(text, fmt).replace(
+            return datetime.datetime.strptime(text.strip(), fmt).replace(
                 tzinfo=datetime.timezone.utc)
         except ValueError:
             pass
     return None
 
 
+def _fp(text: str) -> str:
+    m = re.search(r"SHA256 Fingerprint=([0-9A-Fa-f:]+)", text)
+    return m.group(1) if m else ""
+
+
+def _epoch(ts: int) -> str:
+    return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 3 — Trust Validation
+# Stage 1 — Config validation  (GATE: must pass before cert checks)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_trust(node: Node, timeout: int) -> List[Finding]:
+DEPRECATED_PROTOCOLS = {"SSLV2", "SSLV3", "TLSV1", "TLSV1.1"}
+
+def check_config(node: Node) -> List[Finding]:
+    """
+    Validate cassandra.yaml encryption options.
+    Returns findings; any FAIL here gates all subsequent cert/trust/TLS checks.
+    """
     findings = []
-    enc = node.yaml_data.get("server_encryption_options") or {}
-    ks  = enc.get("keystore",  "")
-    ks_p = enc.get("keystore_password", "")
-    ts  = enc.get("truststore", "")
-    ts_p = enc.get("truststore_password", "")
-    if not (ks and ts and ks_p and ts_p):
-        return [Finding(node.name, "trust_check", "SKIP",
-                        "Missing keystore/truststore config; skipping trust checks.")]
+    enc = _enc(node)
 
-    # Chain length
-    out, _ = ssh_run(node,
-        f'keytool -list -v -keystore {ks} -storepass "{ks_p}" -noprompt 2>&1',
-        timeout)
-    chain_len = len(re.findall(r"Certificate\[", out)) or \
-                len(re.findall(r"-----BEGIN CERTIFICATE-----", out))
-    if chain_len == 1:
-        findings.append(Finding(node.name, "chain_length", "WARN",
-                                "Only 1 cert in keystore chain — possible missing intermediate.",
-                                "Import full chain (leaf + intermediate + root)."))
+    if not enc:
+        return [Finding(node.name, "server_encryption_options", "WARN",
+                        "server_encryption_options not found in cassandra.yaml.",
+                        "Add server_encryption_options block to cassandra.yaml.")]
 
-    # Truststore has at least one CA
-    out_ts, _ = ssh_run(node,
-        f'keytool -list -keystore {ts} -storepass "{ts_p}" -noprompt 2>&1',
-        timeout)
-    if "trustedCertEntry" not in out_ts:
-        findings.append(Finding(node.name, "truststore_empty", "FAIL",
-                                "Truststore has no trustedCertEntry.",
-                                "Import CA certificate into the truststore."))
+    ie = enc.get("internode_encryption", "none")
+    findings.append(Finding(node.name, "internode_encryption", "INFO",
+                            f"internode_encryption = {ie}"))
 
-    # openssl verify (export cert + CA from remote)
-    tmp_cert = f"/tmp/dse_ssl_cert_{node.name}.pem"
-    tmp_ca   = f"/tmp/dse_ssl_ca_{node.name}.pem"
+    # Gate fields: keystore, truststore, passwords
+    for fld in ("keystore", "keystore_password", "truststore", "truststore_password"):
+        if not enc.get(fld):
+            findings.append(Finding(node.name, f"server_{fld}", "FAIL",
+                                    f"server_encryption_options.{fld} is blank or missing.",
+                                    f"Set {fld} in cassandra.yaml server_encryption_options."))
 
-    # Export leaf cert
-    _, rc1 = ssh_run(node,
-        f'keytool -exportcert -alias cassandra -keystore {ks} '
-        f'-storepass "{ks_p}" -rfc -file {tmp_cert} 2>/dev/null', timeout)
+    # Protocol
+    proto = enc.get("protocol", "")
+    if proto.upper() in DEPRECATED_PROTOCOLS:
+        findings.append(Finding(node.name, "deprecated_protocol", "FAIL",
+                                f"Deprecated protocol configured: {proto}",
+                                "Set  protocol: TLS  in server_encryption_options."))
+    elif proto:
+        findings.append(Finding(node.name, "protocol", "INFO", f"protocol = {proto}"))
 
-    # Export all CA certs from truststore
-    aliases_out, _ = ssh_run(node,
-        f'keytool -list -keystore {ts} -storepass "{ts_p}" -noprompt 2>&1 '
-        f'| grep "Alias name:" | awk \'{{print $NF}}\'', timeout)
-    aliases = [a.strip() for a in aliases_out.splitlines() if a.strip()]
+    # optional=true is dangerous in production
+    if enc.get("optional", False):
+        findings.append(Finding(node.name, "server_optional", "WARN",
+                                "server_encryption_options.optional=true — plaintext connections allowed.",
+                                "Set optional: false in production."))
 
-    ca_pems = []
-    for alias in aliases:
-        pem, _ = ssh_run(node,
-            f'keytool -exportcert -alias "{alias}" -keystore {ts} '
-            f'-storepass "{ts_p}" -rfc 2>/dev/null', timeout)
-        if "BEGIN CERTIFICATE" in pem:
-            ca_pems.append(pem)
+    # cipher_suites
+    if not enc.get("cipher_suites"):
+        findings.append(Finding(node.name, "cipher_suites_empty", "WARN",
+                                "cipher_suites not set — JVM defaults will be used.",
+                                "Explicitly set cipher_suites for consistent behaviour."))
 
-    if ca_pems and rc1 == 0:
-        # Write combined CA file
-        ca_block = "\n".join(ca_pems)
-        ssh_run(node, f"cat > {tmp_ca} << 'ENDCA'\n{ca_block}\nENDCA", timeout)
-        verify_out, verify_rc = ssh_run(node,
-            f"openssl verify -CAfile {tmp_ca} {tmp_cert} 2>&1", timeout)
-        if "OK" in verify_out and verify_rc == 0:
-            findings.append(Finding(node.name, "chain_validation", "PASS",
-                                    "Certificate chain validates against truststore."))
-        else:
-            findings.append(Finding(node.name, "chain_validation", "FAIL",
-                                    f"Chain validation failed: {verify_out.strip()[:200]}",
-                                    "Import correct CA into truststore."))
+    # client_encryption_options
+    cenc = node.yaml_data.get("client_encryption_options") or {}
+    if cenc.get("optional"):
+        findings.append(Finding(node.name, "client_optional", "WARN",
+                                "client_encryption_options.optional=true — plaintext CQL allowed.",
+                                "Set optional: false."))
 
-    ssh_run(node, f"rm -f {tmp_cert} {tmp_ca}", timeout)
+    return findings
+
+
+def check_config_consistency(nodes: List[Node]) -> List[Finding]:
+    """Cluster-level: all nodes must agree on key encryption settings."""
+    findings = []
+    for fld in ("internode_encryption", "protocol",
+                "require_client_auth", "require_endpoint_verification"):
+        vals = {n.name: (_enc(n).get(fld, "__unset__")) for n in nodes}
+        if len(set(str(v) for v in vals.values())) > 1:
+            detail = "  ".join(f"{k}={v}" for k, v in vals.items())
+            findings.append(Finding("cluster", f"inconsistent_{fld}", "FAIL",
+                                    f"{fld} differs across nodes: {detail}",
+                                    f"Set identical {fld} on all nodes, then rolling restart."))
+
+    # cipher intersection
+    sets = [set(_enc(n).get("cipher_suites") or []) for n in nodes
+            if _enc(n).get("cipher_suites")]
+    if len(sets) > 1 and not sets[0].intersection(*sets[1:]):
+        findings.append(Finding("cluster", "cipher_suites_disjoint", "FAIL",
+                                "No common cipher suites across nodes — TLS negotiation will fail.",
+                                "Align cipher_suites lists on all nodes."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 4 — TLS Connectivity Mesh
+# Stage 2 — Certificate validation  (GATE: must pass before chain/trust)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_cert(node: Node, warn_days: int, fail_days: int, timeout: int) -> List[Finding]:
+    """
+    Verify keystore is accessible, contains a PrivateKeyEntry, cert is valid
+    and not near expiry.  FAIL here gates chain + trust checks.
+    """
+    findings = []
+    enc   = _enc(node)
+    ks    = enc.get("keystore", "")
+    pwd   = enc.get("keystore_password", "")
+
+    # ── 2a. File exists on node ──────────────────────────────────────────────
+    out, rc = ssh_run(node, f"test -f {ks} && echo EXISTS || echo MISSING", timeout)
+    if "MISSING" in out:
+        return [Finding(node.name, "keystore_file", "FAIL",
+                        f"Keystore not found at {ks}.",
+                        "Check server_encryption_options.keystore path in cassandra.yaml.")]
+
+    # ── 2b. Password correct ─────────────────────────────────────────────────
+    out, rc = ssh_run(node,
+        f'keytool -list -keystore {ks} -storepass "{pwd}" -noprompt 2>&1 | head -3',
+        timeout)
+    if "tampered" in out.lower() or "incorrect" in out.lower() or rc != 0:
+        return [Finding(node.name, "keystore_password", "FAIL",
+                        "Keystore password is wrong or the keystore is corrupt.",
+                        "Correct keystore_password in cassandra.yaml, or re-create the keystore.")]
+
+    # ── 2c. Full keytool -list -v ────────────────────────────────────────────
+    kt_out, _ = ssh_run(node,
+        f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
+        timeout)
+
+    # Entry type must be PrivateKeyEntry
+    if "trustedCertEntry" in kt_out and "PrivateKeyEntry" not in kt_out:
+        findings.append(Finding(node.name, "keystore_entry_type", "FAIL",
+                                "Keystore contains trustedCertEntry but no PrivateKeyEntry.",
+                                "Import the node private key + certificate pair into the keystore."))
+
+    # ── 2d. Expiry ───────────────────────────────────────────────────────────
+    m = re.search(r"Valid from:.*?until:\s*(.+)", kt_out)
+    if m:
+        not_after = _parse_date(m.group(1))
+        if not_after:
+            days  = (not_after - _now()).days
+            sev   = "FAIL" if days < fail_days else "WARN" if days < warn_days else "PASS"
+            findings.append(Finding(
+                node.name, "cert_expiry", sev,
+                f"Certificate expires in {days} days ({not_after.strftime('%Y-%m-%d')}).",
+                "Renew the certificate, import into keystore, restart DSE." if sev != "PASS" else "",
+            ))
+
+    # ── 2e. Not yet valid ────────────────────────────────────────────────────
+    m2 = re.search(r"Valid from:\s*(.+?) until:", kt_out)
+    if m2:
+        not_before = _parse_date(m2.group(1))
+        if not_before and not_before > _now():
+            findings.append(Finding(node.name, "cert_not_yet_valid", "FAIL",
+                                    f"Certificate notBefore={not_before.date()} is in the future.",
+                                    "Check certificate validity dates and system clock."))
+
+    # ── 2f. Signature algorithm ──────────────────────────────────────────────
+    m3 = re.search(r"Signature algorithm name:\s*(.+)", kt_out)
+    if m3:
+        sig = m3.group(1).strip()
+        if any(w in sig.lower() for w in ("md5", "sha1withrsa", "md2")):
+            findings.append(Finding(node.name, "weak_sig_alg", "FAIL",
+                                    f"Weak signature algorithm: {sig}",
+                                    "Replace certificate with one signed using SHA-256 or stronger."))
+
+    # ── 2g. Key size ─────────────────────────────────────────────────────────
+    m4 = re.search(r"(\d+)-bit", kt_out)
+    if m4:
+        sz = int(m4.group(1))
+        if sz < 2048:
+            findings.append(Finding(node.name, "key_size", "FAIL",
+                                    f"Key size {sz} bits is below the 2048-bit minimum.",
+                                    "Replace with a ≥2048-bit key pair."))
+        elif sz < 4096:
+            findings.append(Finding(node.name, "key_size", "WARN",
+                                    f"Key size {sz} bits; 4096 recommended for long-lived certs."))
+
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3 — CA chain validation  (root + intermediate)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_chain(node: Node, timeout: int) -> List[Finding]:
+    """
+    Inspect the full certificate chain (leaf → intermediate → root).
+    Uses keytool to count chain depth, exports each cert, then runs
+    openssl verify with -untrusted for the intermediate CA.
+    """
+    findings = []
+    enc  = _enc(node)
+    ks   = enc.get("keystore", "")
+    kspw = enc.get("keystore_password", "")
+    ts   = enc.get("truststore", "")
+    tspw = enc.get("truststore_password", "")
+
+    if not (ks and kspw and ts and tspw):
+        return [Finding(node.name, "chain_check", "SKIP",
+                        "Missing keystore/truststore config — chain check skipped.")]
+
+    # ── 3a. Chain depth from keytool ─────────────────────────────────────────
+    kt_out, _ = ssh_run(node,
+        f'keytool -list -v -keystore {ks} -storepass "{kspw}" -noprompt 2>&1',
+        timeout)
+
+    # Count "Certificate[N]" markers; fall back to PEM header count
+    depth = len(re.findall(r"Certificate\[\d+\]", kt_out))
+    if depth == 0:
+        depth = len(re.findall(r"-----BEGIN CERTIFICATE-----", kt_out))
+
+    if depth == 0:
+        findings.append(Finding(node.name, "chain_depth", "WARN",
+                                "Could not determine certificate chain depth.",
+                                "Run: keytool -list -v -keystore <ks> to inspect manually."))
+    elif depth == 1:
+        findings.append(Finding(node.name, "chain_depth", "WARN",
+                                "Only 1 certificate in keystore — intermediate CA missing.",
+                                "Import full chain: leaf + intermediate + root into keystore."))
+    else:
+        findings.append(Finding(node.name, "chain_depth", "INFO",
+                                f"Certificate chain depth: {depth} (leaf + {depth-1} CA(s))."))
+
+    # ── 3b. Export leaf cert from keystore ───────────────────────────────────
+    tmp_leaf = f"/tmp/_dse_leaf_{node.name}.pem"
+    _, rc = ssh_run(node,
+        f'keytool -exportcert -alias cassandra -keystore {ks} '
+        f'-storepass "{kspw}" -rfc -file {tmp_leaf} 2>/dev/null',
+        timeout)
+    if rc != 0:
+        findings.append(Finding(node.name, "chain_export", "WARN",
+                                "Could not export leaf cert from keystore (alias 'cassandra' missing?)",
+                                "Check that the alias in server_encryption_options.keystore is 'cassandra'."))
+        return findings
+
+    # ── 3c. Export all truststore CAs ────────────────────────────────────────
+    alias_out, _ = ssh_run(node,
+        f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1 '
+        f'| grep "Alias name:" | sed "s/.*: //"',
+        timeout)
+    aliases = [a.strip() for a in alias_out.splitlines() if a.strip()]
+
+    if not aliases:
+        findings.append(Finding(node.name, "truststore_empty", "FAIL",
+                                "Truststore contains no trusted certificate entries.",
+                                "Import the root (and intermediate) CA into the truststore."))
+        ssh_run(node, f"rm -f {tmp_leaf}", timeout)
+        return findings
+
+    # Separate root CAs (self-signed) from intermediates
+    root_pems   = []
+    inter_pems  = []
+    ca_expiries = []
+
+    for alias in aliases:
+        pem, rc = ssh_run(node,
+            f'keytool -exportcert -alias "{alias}" -keystore {ts} '
+            f'-storepass "{tspw}" -rfc 2>/dev/null',
+            timeout)
+        if "BEGIN CERTIFICATE" not in pem:
+            continue
+
+        # Write to temp to inspect with openssl
+        tmp_ca = f"/tmp/_dse_ca_{node.name}_{alias}.pem"
+        ssh_run(node, f"cat > {tmp_ca} << 'ENDPEM'\n{pem}\nENDPEM", timeout)
+
+        # Check self-signed (subject == issuer)
+        info_out, _ = ssh_run(node,
+            f"openssl x509 -noout -subject -issuer -enddate -in {tmp_ca} 2>/dev/null",
+            timeout)
+        subj_m = re.search(r"subject=(.+)", info_out)
+        issr_m = re.search(r"issuer=(.+)",  info_out)
+        end_m  = re.search(r"notAfter=(.+)", info_out)
+
+        is_root = (subj_m and issr_m and
+                   subj_m.group(1).strip() == issr_m.group(1).strip())
+
+        if is_root:
+            root_pems.append(pem)
+            findings.append(Finding(node.name, "truststore_root_ca", "INFO",
+                                    f"Root CA in truststore: {subj_m.group(1).strip()[:80]}"))
+        else:
+            inter_pems.append(pem)
+            findings.append(Finding(node.name, "truststore_intermediate_ca", "INFO",
+                                    f"Intermediate CA in truststore: "
+                                    f"{subj_m.group(1).strip()[:80] if subj_m else alias}"))
+
+        # CA expiry
+        if end_m:
+            ca_exp = _parse_date(end_m.group(1).strip())
+            if ca_exp:
+                ca_days = (ca_exp - _now()).days
+                if ca_days < 30:
+                    ca_expiries.append(Finding(node.name, "ca_cert_expiry",
+                                               "FAIL" if ca_days < 7 else "WARN",
+                                               f"CA '{alias}' expires in {ca_days} days "
+                                               f"({ca_exp.strftime('%Y-%m-%d')}).",
+                                               "Renew and re-import the CA certificate."))
+
+        ssh_run(node, f"rm -f {tmp_ca}", timeout)
+
+    findings.extend(ca_expiries)
+
+    if not root_pems:
+        findings.append(Finding(node.name, "truststore_no_root", "FAIL",
+                                "No self-signed root CA found in truststore.",
+                                "Import the root CA certificate into the truststore."))
+
+    # ── 3d. openssl verify: leaf against root + intermediates ────────────────
+    # Write root bundle
+    tmp_root  = f"/tmp/_dse_root_{node.name}.pem"
+    tmp_inter = f"/tmp/_dse_inter_{node.name}.pem"
+
+    root_block = "\n".join(root_pems)
+    ssh_run(node, f"cat > {tmp_root} << 'ENDROOT'\n{root_block}\nENDROOT", timeout)
+
+    verify_cmd: str
+    if inter_pems:
+        inter_block = "\n".join(inter_pems)
+        ssh_run(node, f"cat > {tmp_inter} << 'ENDINTER'\n{inter_block}\nENDINTER", timeout)
+        # -untrusted feeds the intermediate; -CAfile is the root of trust
+        verify_cmd = (f"openssl verify -CAfile {tmp_root} "
+                      f"-untrusted {tmp_inter} {tmp_leaf} 2>&1")
+    else:
+        verify_cmd = f"openssl verify -CAfile {tmp_root} {tmp_leaf} 2>&1"
+
+    verify_out, verify_rc = ssh_run(node, verify_cmd, timeout)
+
+    if "OK" in verify_out and verify_rc == 0:
+        findings.append(Finding(node.name, "chain_verify", "PASS",
+                                "openssl verify: certificate chain OK "
+                                f"(root{'+ intermediate' if inter_pems else ''})."))
+    else:
+        # Map common openssl error messages to actionable remediations
+        err = verify_out.strip()
+        fix = "Import the correct root/intermediate CA into the truststore."
+        if "unable to get local issuer" in err:
+            fix = ("Intermediate CA issuer not found. "
+                   "Import the intermediate CA into the truststore or keystore chain.")
+        elif "self signed" in err:
+            fix = ("Self-signed cert presented where a CA-signed cert is expected. "
+                   "Replace with a properly CA-signed certificate.")
+        elif "certificate has expired" in err:
+            fix = "A CA in the chain has expired. Renew and re-import the CA certificate."
+        findings.append(Finding(node.name, "chain_verify", "FAIL",
+                                f"openssl verify FAILED: {err[:200]}", fix))
+
+    # Cleanup
+    ssh_run(node, f"rm -f {tmp_leaf} {tmp_root} {tmp_inter}", timeout)
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 4 — Trust validation  (cross-node CA coverage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_trust(node: Node, timeout: int) -> List[Finding]:
+    """Truststore is populated; basic chain validation passes."""
+    findings = []
+    enc  = _enc(node)
+    ts   = enc.get("truststore", "")
+    tspw = enc.get("truststore_password", "")
+
+    if not (ts and tspw):
+        return [Finding(node.name, "trust_check", "SKIP",
+                        "Truststore config missing — trust check skipped.")]
+
+    # Truststore password
+    out, rc = ssh_run(node,
+        f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1 | head -3',
+        timeout)
+    if "tampered" in out.lower() or "incorrect" in out.lower() or rc != 0:
+        return [Finding(node.name, "truststore_password", "FAIL",
+                        "Truststore password wrong or store corrupt.",
+                        "Correct truststore_password in cassandra.yaml.")]
+
+    # Must contain at least one trustedCertEntry
+    if "trustedCertEntry" not in out:
+        # list without -v for count
+        full_out, _ = ssh_run(node,
+            f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1',
+            timeout)
+        if "trustedCertEntry" not in full_out:
+            return [Finding(node.name, "truststore_empty", "FAIL",
+                            "Truststore contains no trustedCertEntry.",
+                            "Import root CA (and intermediate if applicable) into truststore.")]
+
+    findings.append(Finding(node.name, "truststore", "PASS",
+                            "Truststore accessible and contains trusted CA entries."))
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 5 — TLS connectivity mesh
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TLS_ERRORS = [
-    ("certificate verify failed",     "CA not trusted",               "FAIL"),
-    ("tlsv1 alert unknown ca",        "Target does not trust our CA", "FAIL"),
-    ("ssl handshake failure",         "TLS handshake failed",         "FAIL"),
-    ("no peer certificate available", "Server not presenting cert",   "FAIL"),
-    ("alert handshake failure",       "Protocol/cipher mismatch",     "FAIL"),
-    ("dh key too small",              "Weak DH parameters",           "WARN"),
-    ("no subject alternative names",  "No SAN — endpoint verify may fail", "WARN"),
-    ("connection refused",            "SSL port not open",            "FAIL"),
+    ("certificate verify failed",     "CA not trusted / chain incomplete",          "FAIL",
+     "Import the signing CA into the truststore on the source node."),
+    ("tlsv1 alert unknown ca",        "Target node does not trust the source CA",   "FAIL",
+     "Import the source node's CA into the target node's truststore."),
+    ("ssl handshake failure",         "TLS handshake failed (protocol/cipher mismatch)", "FAIL",
+     "Align protocol and cipher_suites across all nodes."),
+    ("no peer certificate available", "Server not presenting a certificate",        "FAIL",
+     "Check server_encryption_options.keystore on the target node."),
+    ("alert handshake failure",       "Protocol or cipher negotiation failed",      "FAIL",
+     "Ensure matching protocol/cipher_suites config on both nodes."),
+    ("connection refused",            "SSL port not open — internode_encryption may be off", "FAIL",
+     "Enable internode_encryption and verify port 7001 is listening."),
+    ("dh key too small",              "Weak DH parameters rejected by JVM",         "WARN",
+     "Upgrade Java or set -Djdk.tls.ephemeralDHKeySize=2048 in jvm.options."),
+    ("no subject alternative names",  "No SAN in cert — endpoint verification may fail", "WARN",
+     "Add SAN to certificate or disable require_endpoint_verification."),
 ]
+
 
 def check_tls_pair(src: Node, tgt_host: str, tgt_name: str,
                    port: int, timeout: int) -> List[Finding]:
-    enc  = src.yaml_data.get("server_encryption_options") or {}
-    ts   = enc.get("truststore", "")
+    label  = f"{src.name}→{tgt_name}"
+    ts     = _enc(src).get("truststore", "")
     ca_arg = f"-CAfile {ts}" if ts else ""
-    label = f"{src.name}→{tgt_name}"
 
-    # TCP check
+    # TCP reachability first
     tcp_out, _ = ssh_run(src,
         f"timeout 5 bash -c 'echo > /dev/tcp/{tgt_host}/{port}' 2>&1 "
         f"&& echo TCP_OK || echo TCP_FAIL", timeout)
     if "TCP_FAIL" in tcp_out:
         return [Finding(src.name, "tcp_reachability", "FAIL",
-                        f"[{label}] TCP to {tgt_host}:{port} failed.",
-                        f"Check firewall rules for port {port}.")]
+                        f"[{label}] TCP to {tgt_host}:{port} unreachable.",
+                        f"Check firewall rules for port {port} between nodes.")]
 
     # TLS handshake
-    out, _ = ssh_run(src,
+    hs_out, _ = ssh_run(src,
         f"echo | timeout {timeout} openssl s_client "
         f"-connect {tgt_host}:{port} {ca_arg} -showcerts 2>&1",
         timeout)
-    lower = out.lower()
+    lower = hs_out.lower()
 
-    for pattern, diagnosis, sev in _TLS_ERRORS:
+    for pattern, diagnosis, sev, fix in _TLS_ERRORS:
         if pattern in lower:
             return [Finding(src.name, "tls_handshake", sev,
-                            f"[{label}] {diagnosis}")]
+                            f"[{label}] {diagnosis}", fix)]
 
-    proto_m  = re.search(r"Protocol\s*:\s*(\S+)",    out, re.I)
-    cipher_m = re.search(r"Cipher\s*:\s*(\S+)",      out, re.I)
-    verify_m = re.search(r"Verify return code:\s*(\d+)", out)
+    proto_m  = re.search(r"Protocol\s*:\s*(\S+)",        hs_out, re.I)
+    cipher_m = re.search(r"Cipher\s*:\s*(\S+)",          hs_out, re.I)
+    verify_m = re.search(r"Verify return code:\s*(\d+)", hs_out)
 
-    proto  = proto_m.group(1)  if proto_m  else "?"
-    cipher = cipher_m.group(1) if cipher_m else "?"
+    proto  = proto_m.group(1)       if proto_m  else "?"
+    cipher = cipher_m.group(1)      if cipher_m else "?"
     vcode  = int(verify_m.group(1)) if verify_m else -1
 
     if proto.lower() in ("tlsv1", "tlsv1.1"):
-        return [Finding(src.name, "deprecated_protocol_negotiated", "FAIL",
+        return [Finding(src.name, "deprecated_protocol", "FAIL",
                         f"[{label}] Deprecated protocol negotiated: {proto}",
-                        "Remove TLSv1/TLSv1.1 from protocol config.")]
+                        "Remove TLSv1/TLSv1.1 from protocol and cipher_suites config.")]
 
-    if vcode != 0:
-        return [Finding(src.name, "tls_verify_failed", "FAIL",
-                        f"[{label}] Verify code {vcode}. proto={proto}",
-                        "Check certificate chain and truststore.")]
+    if vcode != 0 and vcode != -1:
+        return [Finding(src.name, "tls_verify", "FAIL",
+                        f"[{label}] Verify return code {vcode}  proto={proto}",
+                        "Check certificate chain and truststore contents on both nodes.")]
 
     return [Finding(src.name, "tls_handshake", "PASS",
                     f"[{label}] OK  proto={proto}  cipher={cipher}")]
@@ -535,7 +704,6 @@ def check_tls_pair(src: Node, tgt_host: str, tgt_name: str,
 
 def check_tls_mesh(nodes: List[Node], port: int,
                    timeout: int, threads: int) -> List[Finding]:
-    findings = []
     pairs = [(s, t) for s in nodes for t in nodes if s.name != t.name]
 
     def _run(pair):
@@ -543,270 +711,242 @@ def check_tls_mesh(nodes: List[Node], port: int,
         host = t.yaml_data.get("listen_address") or t.host
         return check_tls_pair(s, host, t.name, port, timeout)
 
+    findings = []
     with ThreadPoolExecutor(max_workers=threads) as ex:
         for fut in as_completed(ex.submit(_run, p) for p in pairs):
             try:
                 findings.extend(fut.result())
-            except Exception as e:
-                logging.error("TLS mesh error: %s", e)
-
+            except Exception as exc:
+                log.error("TLS mesh error: %s", exc)
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 5 — Cert Match (keystore vs live fingerprint)
+# Stage 6 — Cert match (keystore vs live TLS fingerprint)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_cert_match(node: Node, port: int, timeout: int) -> List[Finding]:
-    enc = node.yaml_data.get("server_encryption_options") or {}
+    enc = _enc(node)
     ks  = enc.get("keystore", "")
     pwd = enc.get("keystore_password", "")
     if not ks or not pwd:
         return []
 
-    tmp = f"/tmp/dse_ssl_cm_{node.name}.pem"
-
-    # Keystore fingerprint
+    tmp = f"/tmp/_dse_cm_{node.name}.pem"
     ssh_run(node,
         f'keytool -exportcert -alias cassandra -keystore {ks} '
         f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout)
-    ks_fp_out, _ = ssh_run(node,
+    ks_fp_out, _  = ssh_run(node,
         f"openssl x509 -noout -fingerprint -sha256 -in {tmp} 2>/dev/null", timeout)
     ssh_run(node, f"rm -f {tmp}", timeout)
 
-    # Live fingerprint
     live_fp_out, _ = ssh_run(node,
         f"echo | timeout {timeout} openssl s_client -connect localhost:{port} "
         f"2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null", timeout)
 
-    ks_fp   = _extract_fp(ks_fp_out)
-    live_fp = _extract_fp(live_fp_out)
+    ks_fp   = _fp(ks_fp_out)
+    live_fp = _fp(live_fp_out)
 
     if not ks_fp:
-        return []
-
+        return [Finding(node.name, "cert_match", "SKIP",
+                        "Could not extract keystore fingerprint.")]
     if not live_fp:
         return [Finding(node.name, "cert_match", "INFO",
-                        f"No live TLS on port {port}; cannot compare fingerprints.")]
-
+                        f"No live TLS on port {port} — cannot compare fingerprints.")]
     if ks_fp.upper() == live_fp.upper():
         return [Finding(node.name, "cert_match", "PASS",
-                        "Keystore cert matches live TLS cert.")]
-
+                        "Keystore cert fingerprint matches live TLS cert.")]
     return [Finding(node.name, "cert_match", "FAIL",
-                    "Keystore cert does NOT match live TLS cert — DSE not restarted after update.",
-                    "Perform a rolling restart of DSE.")]
-
-
-def _extract_fp(text: str) -> str:
-    m = re.search(r"SHA256 Fingerprint=([0-9A-Fa-f:]+)", text)
-    return m.group(1) if m else ""
+                    "Keystore cert does NOT match live TLS cert — DSE not restarted after cert update.",
+                    "Perform a rolling restart of DSE to load the new certificate.")]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 6 — Hostname / SAN Validation
+# Stage 7 — Hostname / SAN validation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_hostname(node: Node, timeout: int) -> List[Finding]:
-    enc = node.yaml_data.get("server_encryption_options") or {}
+    enc = _enc(node)
     ks  = enc.get("keystore", "")
     pwd = enc.get("keystore_password", "")
     rev = bool(enc.get("require_endpoint_verification", False))
     if not ks or not pwd:
         return []
 
-    # Extract SAN + CN from keystore
-    tmp = f"/tmp/dse_ssl_hn_{node.name}.pem"
+    tmp = f"/tmp/_dse_hn_{node.name}.pem"
     ssh_run(node,
         f'keytool -exportcert -alias cassandra -keystore {ks} '
         f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout)
     san_out, _ = ssh_run(node,
-        f"openssl x509 -noout -subject -ext subjectAltName -in {tmp} 2>/dev/null",
-        timeout)
+        f"openssl x509 -noout -subject -ext subjectAltName -in {tmp} 2>/dev/null", timeout)
     ssh_run(node, f"rm -f {tmp}", timeout)
 
-    san_dns = re.findall(r"DNS:([^,\n]+)", san_out)
-    san_ip  = re.findall(r"IP Address:([^,\n]+)", san_out)
+    san_dns = [s.strip() for s in re.findall(r"DNS:([^,\n]+)", san_out)]
+    san_ip  = [s.strip() for s in re.findall(r"IP Address:([^,\n]+)", san_out)]
     cn_m    = re.search(r"CN\s*=\s*([^,\n/]+)", san_out)
     cn      = cn_m.group(1).strip() if cn_m else ""
-    san_dns = [s.strip() for s in san_dns]
-    san_ip  = [s.strip() for s in san_ip]
 
     findings = [Finding(node.name, "cert_identities", "INFO",
-                        f"CN={cn}  SAN_DNS={san_dns}  SAN_IP={san_ip}")]
+                        f"CN={cn}  DNS={san_dns}  IP={san_ip}")]
 
-    # Addresses to check
-    yaml = node.yaml_data
-    addrs = {k: yaml.get(k, "") for k in
+    addrs = {k: node.yaml_data.get(k, "") for k in
              ("listen_address", "broadcast_address", "rpc_address")}
     hn_out, _ = ssh_run(node, "hostname -f 2>/dev/null || hostname", timeout)
     if hn_out.strip():
-        addrs["system_hostname"] = hn_out.strip()
+        addrs["hostname"] = hn_out.strip()
 
     for addr_type, addr_val in addrs.items():
         if not addr_val or addr_val == "0.0.0.0":
             continue
-        is_ip = bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", addr_val))
-        if is_ip:
-            matched = addr_val in san_ip
-        else:
-            matched = (addr_val in san_dns or addr_val == cn or
-                       any(addr_val.endswith("." + d.lstrip("*.")) for d in san_dns))
-
+        is_ip   = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", addr_val))
+        matched = (addr_val in san_ip) if is_ip else (
+            addr_val in san_dns or addr_val == cn or
+            any(addr_val.endswith("." + d.lstrip("*.")) for d in san_dns)
+        )
         if not matched:
-            sev = "FAIL" if rev and addr_type in ("listen_address", "system_hostname") else "WARN"
-            findings.append(Finding(node.name, "hostname_san_mismatch", sev,
-                                    f"{addr_type}={addr_val} not in cert SAN/CN.",
-                                    "Add to SAN or disable require_endpoint_verification."))
-
+            sev = "FAIL" if rev and addr_type in ("listen_address", "hostname") else "WARN"
+            findings.append(Finding(node.name, "san_mismatch", sev,
+                                    f"{addr_type}={addr_val} not present in cert SAN/CN.",
+                                    "Add the IP/hostname to the certificate SAN, "
+                                    "or set require_endpoint_verification: false."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 7 — JMX SSL
+# Stage 8 — JMX SSL (port 7199)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_jmx(node: Node, timeout: int) -> List[Finding]:
     findings = []
-
     ps_out, _ = ssh_run(node,
         "ps -ef | grep -E 'jmxremote|Djavax.net.ssl' | grep -v grep 2>/dev/null || true",
         timeout)
     jmx_ssl = "jmxremote.ssl=true" in ps_out
     findings.append(Finding(node.name, "jmx_ssl_flag",
                             "PASS" if jmx_ssl else "WARN",
-                            f"jmxremote.ssl={'true' if jmx_ssl else 'false/absent'}",
-                            "Set -Dcom.sun.management.jmxremote.ssl=true in cassandra-env.sh." if not jmx_ssl else ""))
+                            f"jmxremote.ssl={'true' if jmx_ssl else 'false/absent'}.",
+                            "Add -Dcom.sun.management.jmxremote.ssl=true to cassandra-env.sh." if not jmx_ssl else ""))
 
-    # TCP + TLS on 7199
     tcp_out, _ = ssh_run(node, "nc -zv -w5 localhost 7199 2>&1 || echo CLOSED", timeout)
     if "CLOSED" in tcp_out or "refused" in tcp_out.lower():
-        findings.append(Finding(node.name, "jmx_port_7199", "WARN",
-                                "JMX port 7199 not listening."))
+        findings.append(Finding(node.name, "jmx_port", "WARN", "JMX port 7199 not listening."))
         return findings
 
     tls_out, _ = ssh_run(node,
-        "echo | timeout 10 openssl s_client -connect localhost:7199 2>&1 | head -20",
-        timeout)
-    if "CONNECTED" in tls_out and "handshake failure" not in tls_out.lower():
-        findings.append(Finding(node.name, "jmx_tls", "PASS",
-                                "TLS handshake on JMX port 7199 succeeded."))
-    else:
-        findings.append(Finding(node.name, "jmx_tls", "WARN",
-                                "JMX port 7199 open but TLS inconclusive.",
-                                "Verify JMX SSL flags in cassandra-env.sh."))
-
+        "echo | timeout 10 openssl s_client -connect localhost:7199 2>&1 | head -20", timeout)
+    connected = "CONNECTED" in tls_out
+    failed    = "handshake failure" in tls_out.lower()
+    findings.append(Finding(node.name, "jmx_tls",
+                            "PASS" if connected and not failed else "WARN",
+                            "JMX TLS handshake OK." if (connected and not failed)
+                            else "JMX port open but TLS handshake inconclusive.",
+                            "" if (connected and not failed) else
+                            "Verify javax.net.ssl.keyStore/trustStore flags in cassandra-env.sh."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 8 — Native Transport SSL
+# Stage 9 — Native transport SSL (ports 9042 / 9142)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_native_ssl(node: Node, timeout: int) -> List[Finding]:
     findings = []
-    cenc = node.yaml_data.get("client_encryption_options") or {}
+    cenc    = node.yaml_data.get("client_encryption_options") or {}
     enabled = cenc.get("enabled", False)
-    ts = (node.yaml_data.get("server_encryption_options") or {}).get("truststore", "")
-    ca_arg = f"-CAfile {ts}" if ts else ""
+    ts      = _enc(node).get("truststore", "")
+    ca_arg  = f"-CAfile {ts}" if ts else ""
 
     for port in (9042, 9142):
-        tcp_out, _ = ssh_run(node, f"ss -lntp 2>/dev/null | grep :{port} || echo CLOSED", timeout)
-        is_open = str(port) in tcp_out and "CLOSED" not in tcp_out
+        ss_out, _ = ssh_run(node, f"ss -lntp 2>/dev/null | grep :{port}", timeout)
+        is_open   = str(port) in ss_out
         if port == 9042:
             findings.append(Finding(node.name, f"port_{port}",
                                     "PASS" if is_open else "WARN",
-                                    f"Port {port} {'open' if is_open else 'closed'}."))
+                                    f"CQL port {port} {'open' if is_open else 'closed'}."))
         if is_open and enabled:
             out, _ = ssh_run(node,
                 f"echo | timeout {timeout} openssl s_client "
-                f"-connect localhost:{port} {ca_arg} 2>&1 | head -15",
-                timeout)
-            verify_m = re.search(r"Verify return code:\s*(\d+)", out)
-            vcode = int(verify_m.group(1)) if verify_m else -1
-            status = "PASS" if vcode == 0 else "WARN" if "CONNECTED" in out else "FAIL"
-            findings.append(Finding(node.name, f"native_tls_{port}", status,
-                                    f"Native transport TLS on port {port}: verify={vcode}"))
-
+                f"-connect localhost:{port} {ca_arg} 2>&1 | head -15", timeout)
+            vm = re.search(r"Verify return code:\s*(\d+)", out)
+            vc = int(vm.group(1)) if vm else -1
+            findings.append(Finding(node.name, f"native_tls_{port}",
+                                    "PASS" if vc == 0 else ("WARN" if "CONNECTED" in out else "FAIL"),
+                                    f"Native TLS port {port}: verify={vc}."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 9 — OpsCenter / Agent SSL
+# Stage 10 — OpsCenter / Agent SSL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Finding]:
-    findings = []
+    findings  = []
     conf_path = ops_cfg.get("conf", "/etc/opscenter/opscenterd.conf")
-    ops_node  = Node(name="opscenter", host=ops_cfg.get("host", ""),
+    ops       = Node(name="opscenter", host=ops_cfg.get("host", ""),
                      ssh_user=ops_cfg.get("ssh_user", "ubuntu"),
-                     ssh_key =ops_cfg.get("ssh_key", ""))
+                     ssh_key =ops_cfg.get("ssh_key",  ""))
+    if not ops.host:
+        return []
 
-    if not ops_node.host:
-        return findings
-
-    # Read [agents] section
-    out, rc = ssh_run(ops_node,
-        f'grep -A20 "\\[agents\\]" {conf_path} 2>/dev/null', timeout)
+    out, rc = ssh_run(ops, f'grep -A20 "\\[agents\\]" {conf_path} 2>/dev/null', timeout)
     if rc != 0 or not out.strip():
         return [Finding("opscenter", "opscenterd_conf", "SKIP",
                         f"opscenterd.conf not readable at {conf_path}.")]
 
-    use_ssl = "use_ssl" in out and re.search(r"use_ssl\s*=\s*true", out, re.I)
+    use_ssl = bool(re.search(r"use_ssl\s*=\s*true", out, re.I))
     findings.append(Finding("opscenter", "opscenter_use_ssl",
                             "PASS" if use_ssl else "WARN",
-                            f"[agents] use_ssl={'true' if use_ssl else 'false/absent'}",
-                            "Set use_ssl = true in [agents]."))
+                            f"[agents] use_ssl = {'true' if use_ssl else 'false/absent'}.",
+                            "Set  use_ssl = true  in opscenterd.conf [agents]."))
 
-    # ssl_keyfile must NOT be a JKS
     m = re.search(r"ssl_keyfile\s*=\s*(\S+)", out)
     if m:
         kf = m.group(1)
-        if kf.endswith((".jks", ".p12", ".pfx")):
+        if kf.lower().endswith((".jks", ".p12", ".pfx")):
             findings.append(Finding("opscenter", "opscenter_wrong_keyfile", "FAIL",
-                                    f"ssl_keyfile={kf} is a Java keystore, not an OpsCenter key.",
-                                    "Set ssl_keyfile to OpsCenter's PEM private key."))
+                                    f"ssl_keyfile={kf} is a Java keystore — must be a PEM private key.",
+                                    "Set ssl_keyfile to OpsCenter's own PEM key "
+                                    "(/etc/opscenter/ssl/opscenter.key), NOT a DSE node JKS."))
         else:
             findings.append(Finding("opscenter", "opscenter_keyfile", "PASS",
-                                    f"ssl_keyfile={kf} appears correct (non-JKS)."))
+                                    f"ssl_keyfile={kf} (non-JKS)."))
     else:
         findings.append(Finding("opscenter", "opscenter_keyfile_missing", "FAIL",
                                 "ssl_keyfile not set in [agents].",
                                 "Set ssl_keyfile = /etc/opscenter/ssl/opscenter.key"))
 
-    # Agent port checks from DSE nodes
     for n in nodes:
         for port, label in ((61620, "agent_http"), (61621, "agent_stomp_ssl")):
             out2, _ = ssh_run(n,
-                f"nc -zv -w5 {ops_node.host} {port} 2>&1 || echo CLOSED", timeout)
+                f"nc -zv -w5 {ops.host} {port} 2>&1 || echo CLOSED", timeout)
             up = "CLOSED" not in out2 and "refused" not in out2.lower()
-            findings.append(Finding(n.name, f"{label}_port",
+            findings.append(Finding(n.name, label,
                                     "PASS" if up else "WARN",
-                                    f"Port {port} ({label}) on OpsCenter: {'reachable' if up else 'unreachable'}."))
-
+                                    f"OpsCenter port {port} ({label}): "
+                                    f"{'reachable' if up else 'unreachable'}."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 10 — Cipher Compatibility
+# Stage 11 — Cipher compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 
-_WEAK_CIPHER_FAIL = re.compile(r"(_RC4_|_RC2_|_DES_|_3DES_|EXPORT|_NULL_|_anon_)", re.I)
-_WEAK_CIPHER_WARN = re.compile(r"(_MD5|_SHA(?:[^2-9]|$))", re.I)
+_WEAK_FAIL = re.compile(r"(_RC4_|_RC2_|_DES_|_3DES_|EXPORT|_NULL_|_anon_)", re.I)
+_WEAK_WARN = re.compile(r"(_MD5|_SHA(?:[^2-9]|$))", re.I)
+
 
 def check_ciphers(node: Node, timeout: int) -> List[Finding]:
     findings = []
-    enc = node.yaml_data.get("server_encryption_options") or {}
-    for cipher in enc.get("cipher_suites") or []:
-        if _WEAK_CIPHER_FAIL.search(cipher):
+    for cipher in _enc(node).get("cipher_suites") or []:
+        if _WEAK_FAIL.search(cipher):
             findings.append(Finding(node.name, "weak_cipher", "FAIL",
-                                    f"Weak cipher in config: {cipher}",
+                                    f"Broken cipher in config: {cipher}",
                                     f"Remove {cipher} from cipher_suites."))
-        elif _WEAK_CIPHER_WARN.search(cipher):
+        elif _WEAK_WARN.search(cipher):
             findings.append(Finding(node.name, "weak_cipher", "WARN",
-                                    f"Weak cipher in config: {cipher}"))
+                                    f"Weak cipher in config: {cipher}",
+                                    f"Replace {cipher} with a modern ECDHE/GCM cipher."))
 
-    # Live negotiated cipher
     out, _ = ssh_run(node,
         "echo | timeout 10 openssl s_client -connect localhost:7001 2>/dev/null "
         "| grep '^ *Cipher'", timeout)
@@ -815,22 +955,21 @@ def check_ciphers(node: Node, timeout: int) -> List[Finding]:
         live = m.group(1)
         findings.append(Finding(node.name, "live_cipher", "INFO",
                                 f"Negotiated cipher on :7001 = {live}"))
-        if _WEAK_CIPHER_FAIL.search(live):
+        if _WEAK_FAIL.search(live):
             findings.append(Finding(node.name, "weak_live_cipher", "FAIL",
-                                    f"Weak cipher negotiated: {live}"))
-
+                                    f"Broken cipher actually negotiated: {live}",
+                                    "Remove from cipher_suites and restart DSE."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 11 — Version Compatibility
+# Stage 12 — Java / TLS version compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_versions(node: Node, timeout: int) -> List[Finding]:
+def check_versions(node: Node) -> List[Finding]:
     findings = []
     ver = node.java_version
-
-    m = re.search(r"1\.(\d+)\.0[_.](\d+)", ver)  # old: 1.8.0_301
+    m   = re.search(r"1\.(\d+)\.0[_.](\d+)", ver)     # 1.8.0_301
     if m:
         major, update = int(m.group(1)), int(m.group(2))
     else:
@@ -838,39 +977,35 @@ def check_versions(node: Node, timeout: int) -> List[Finding]:
         major, update = (int(m2.group(1)), int(m2.group(2))) if m2 else (0, 0)
 
     findings.append(Finding(node.name, "java_version", "INFO",
-                            f"Java {ver}  (major={major}, update={update})"))
+                            f"Java {ver}  (major={major} update={update})"))
 
     if major == 8 and 0 < update < 261:
         findings.append(Finding(node.name, "tls13_unavailable", "WARN",
                                 f"Java 8u{update} (<261) does not support TLSv1.3.",
-                                "Upgrade to Java 8u261+ or Java 11+."))
+                                "Upgrade to Java 8u261+ or Java 11+ for TLSv1.3 support."))
 
-    # DSE 6.9 + Java < 17
-    dv = node.dse_version
-    if re.match(r"6\.9", dv) and major < 17:
+    if re.match(r"6\.9", node.dse_version) and major < 17:
         findings.append(Finding(node.name, "dse69_java17", "WARN",
-                                "DSE 6.9 recommends Java 17. JKS deprecated, prefer PKCS12.",
-                                "Upgrade to Java 17."))
-
+                                "DSE 6.9 recommends Java 17; JKS format deprecated.",
+                                "Upgrade to Java 17 and migrate keystores to PKCS12."))
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 12 — Restart Detection
+# Stage 13 — Restart detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_restart(node: Node, timeout: int) -> List[Finding]:
     findings = []
     if node.proc_start == 0:
         return [Finding(node.name, "dse_process", "WARN",
-                        "CassandraDaemon not found; DSE may not be running.")]
+                        "CassandraDaemon process not found — DSE may not be running.")]
 
     findings.append(Finding(node.name, "dse_process", "PASS",
-                            f"DSE running, started {_epoch(node.proc_start)}."))
+                            f"DSE running since {_epoch(node.proc_start)}."))
 
-    enc = node.yaml_data.get("server_encryption_options") or {}
-    for label, path in (("keystore", enc.get("keystore", "")),
-                        ("truststore", enc.get("truststore", ""))):
+    for label, path in (("keystore",   _enc(node).get("keystore",   "")),
+                        ("truststore", _enc(node).get("truststore", ""))):
         if not path:
             continue
         out, _ = ssh_run(node, f"stat -c '%Y' {path} 2>/dev/null || echo 0", timeout)
@@ -880,195 +1015,177 @@ def check_restart(node: Node, timeout: int) -> List[Finding]:
             continue
         if mtime > node.proc_start:
             findings.append(Finding(node.name, "restart_required", "WARN",
-                                    f"{label} modified {_epoch(mtime)} but DSE started "
-                                    f"{_epoch(node.proc_start)} — restart required.",
-                                    "Rolling restart DSE to load updated keystore."))
-
+                                    f"{label} modified {_epoch(mtime)} but DSE "
+                                    f"started {_epoch(node.proc_start)} — reload required.",
+                                    "Perform a rolling restart of DSE."))
     return findings
 
 
-def _epoch(ts: int) -> str:
-    return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 13 — Log & Runtime Scan
+# Stage 14 — Log & runtime scan
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LOG_PATTERNS = [
     ("SSLHandshakeException",                   "TLS handshake failed",           "FAIL"),
     ("No appropriate protocol",                 "Protocol version mismatch",      "FAIL"),
-    ("PKIX path building failed",               "Certificate chain / CA missing", "FAIL"),
+    ("PKIX path building failed",               "Chain / CA missing",             "FAIL"),
     ("unable to find valid certification path", "Missing CA in truststore",       "FAIL"),
-    ("certificate_expired",                     "Expired certificate presented",  "FAIL"),
-    ("Keystore was tampered",                   "Wrong password / corrupt file",  "FAIL"),
+    ("certificate_expired",                     "Expired cert in use",            "FAIL"),
+    ("Keystore was tampered",                   "Wrong password / corrupt store", "FAIL"),
     ("TrustAnchors parameter",                  "Empty truststore",               "FAIL"),
-    ("EOFException",                            "Plaintext sent to SSL port",     "FAIL"),
-    ("dh key too small",                        "Weak DH parameters",             "WARN"),
+    ("EOFException",                            "Plaintext sent to TLS port",     "FAIL"),
+    ("dh key too small",                        "Weak DH params",                 "WARN"),
     ("javax.net.ssl.SSLException",              "Generic SSL exception",          "WARN"),
 ]
-
 _LOG_PATHS = [
     "/var/log/cassandra/system.log",
     "/var/log/dse/cassandra/system.log",
     "/var/log/dse/system.log",
 ]
 
+
 def check_logs(node: Node, timeout: int) -> List[Finding]:
     findings = []
 
-    # Find system.log
     log_path = ""
     for p in _LOG_PATHS:
-        out, rc = ssh_run(node, f"test -f {p} && echo yes || echo no", timeout)
+        out, _ = ssh_run(node, f"test -f {p} && echo yes", timeout)
         if "yes" in out:
             log_path = p
             break
-
     if not log_path:
         return [Finding(node.name, "system_log", "WARN",
                         "system.log not found at expected paths.")]
 
     out, _ = ssh_run(node,
         f'grep -Ei "ssl|tls|handshake|certificate|pkix|trustanchor|keystore|truststore" '
-        f'{log_path} | tail -200 2>&1', timeout)
+        f'{log_path} | tail -200 2>&1', 30)
 
     if not out.strip():
-        return [Finding(node.name, "ssl_log_errors", "PASS",
+        return [Finding(node.name, "ssl_log", "PASS",
                         f"No SSL/TLS errors in {log_path}.")]
 
     seen = set()
     for pattern, diagnosis, sev in _LOG_PATTERNS:
         if pattern.lower() in out.lower() and pattern not in seen:
             seen.add(pattern)
-            sample = next((ln.strip()[-180:] for ln in out.splitlines()
+            sample = next((ln.strip()[-160:] for ln in out.splitlines()
                            if pattern.lower() in ln.lower()), "")
             findings.append(Finding(node.name, "ssl_log_error", sev,
-                                    f"{diagnosis}: {sample}"))
-
+                                    f"{diagnosis} — {sample}"))
     if not seen:
-        findings.append(Finding(node.name, "ssl_log_errors", "INFO",
+        findings.append(Finding(node.name, "ssl_log", "INFO",
                                 "SSL log entries found but no critical patterns matched."))
 
     # Clock skew
     ts_out, _ = ssh_run(node, "timedatectl status 2>/dev/null | head -5", timeout)
-    if "no" in ts_out.lower() or "unsync" in ts_out.lower():
+    if ts_out and ("no" in ts_out.lower() or "unsync" in ts_out.lower()):
         findings.append(Finding(node.name, "clock_skew", "WARN",
-                                "System clock not synchronized.",
-                                "Run: chronyc makestep"))
+                                "System clock not synchronized — may cause cert validity errors.",
+                                "Run: chronyc makestep  or  ntpdate -u pool.ntp.org"))
 
     # Runtime ports
     ss_out, _ = ssh_run(node, "ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null", timeout)
-    enc = node.yaml_data.get("server_encryption_options") or {}
-    ie  = enc.get("internode_encryption", "none")
-
+    ie = _enc(node).get("internode_encryption", "none")
     if ie == "all" and ":7000 " in ss_out:
         findings.append(Finding(node.name, "plaintext_port_open", "WARN",
-                                "Port 7000 open despite internode_encryption=all.",
+                                "Port 7000 (plaintext internode) open with internode_encryption=all.",
                                 "Firewall port 7000 after rolling restart."))
-
-    for port, sev_if_closed in ((7001, "WARN"), (9042, "WARN"), (7199, "INFO")):
-        open_ = f":{port} " in ss_out or f":{port}\t" in ss_out
-        if not open_ and port in (7001,) and ie != "none":
-            findings.append(Finding(node.name, f"port_{port}", sev_if_closed,
-                                    f"Port {port} (SSL internode) not listening."))
+    if ie != "none" and ":7001 " not in ss_out:
+        findings.append(Finding(node.name, "ssl_port_closed", "WARN",
+                                "Port 7001 (internode SSL) not listening."))
 
     return findings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Report
+# Result helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SEVERITY_ORDER = {"FAIL": 0, "WARN": 1, "INFO": 2, "SKIP": 3, "PASS": 4}
-_ANSI = {"FAIL": "\033[91m", "WARN": "\033[93m", "PASS": "\033[92m",
-         "INFO": "\033[94m", "SKIP": "\033[90m", "RESET": "\033[0m"}
+_SEV = {"FAIL": 0, "WARN": 1, "INFO": 2, "SKIP": 3, "PASS": 4}
+_CLR = {"FAIL": "\033[91m", "WARN": "\033[93m", "PASS": "\033[92m",
+        "INFO": "\033[94m", "SKIP": "\033[90m", "RESET": "\033[0m"}
 
 
-def _colour(status: str, text: str, no_colour: bool = False) -> str:
-    if no_colour:
-        return text
-    return f"{_ANSI.get(status, '')}{text}{_ANSI['RESET']}"
+def _colour(status: str, text: str, nc: bool) -> str:
+    return text if nc else f"{_CLR.get(status, '')}{text}{_CLR['RESET']}"
 
 
 def _worst(findings: List[Finding]) -> str:
     if not findings:
         return "PASS"
-    return min((f.status for f in findings),
-               key=lambda s: _SEVERITY_ORDER.get(s, 99))
+    return min((f.status for f in findings), key=lambda s: _SEV.get(s, 99))
 
 
-def _health_score(findings: List[Finding]) -> int:
+def _score(findings: List[Finding]) -> int:
     rel = [f for f in findings if f.status not in ("SKIP", "INFO")]
     if not rel:
         return 100
     return round(sum(1 for f in rel if f.status == "PASS") / len(rel) * 100)
 
 
-def print_report(findings: List[Finding], no_colour: bool = False) -> None:
-    counts = {s: 0 for s in ("PASS", "WARN", "FAIL", "INFO", "SKIP")}
-    for f in findings:
-        counts[f.status] = counts.get(f.status, 0) + 1
+def _has_fail(findings: List[Finding]) -> bool:
+    return any(f.status == "FAIL" for f in findings)
 
-    ovr   = _worst(findings)
-    score = _health_score(findings)
 
-    bar_w = 40
-    filled = round(bar_w * score / 100)
-    bar = "█" * filled + "░" * (bar_w - filled)
+# ─────────────────────────────────────────────────────────────────────────────
+# Report
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("\n" + "─" * 64)
-    print(f"  DSE SSL Validator  |  Overall: {_colour(ovr, ovr, no_colour)}"
-          f"  |  Score: {score}%")
-    print(f"  {bar}  {score}%")
+def print_report(findings: List[Finding], no_colour: bool) -> None:
+    counts = {s: sum(1 for f in findings if f.status == s)
+              for s in ("PASS", "WARN", "FAIL", "INFO", "SKIP")}
+    ovr    = _worst(findings)
+    sc     = _score(findings)
+    filled = round(40 * sc / 100)
+    bar    = "█" * filled + "░" * (40 - filled)
+
+    print(f"\n{'─'*64}")
+    print(f"  DSE SSL Validator  │  "
+          f"Overall: {_colour(ovr, ovr, no_colour)}  │  Score: {sc}%")
+    print(f"  {bar}  {sc}%")
     print(f"  PASS:{counts['PASS']}  WARN:{counts['WARN']}  "
           f"FAIL:{counts['FAIL']}  INFO:{counts['INFO']}  SKIP:{counts['SKIP']}")
-    print("─" * 64)
+    print(f"{'─'*64}")
 
-    # Print only FAIL + WARN
     actionable = sorted(
         [f for f in findings if f.status in ("FAIL", "WARN")],
-        key=lambda f: (_SEVERITY_ORDER[f.status], f.node)
+        key=lambda f: (_SEV[f.status], f.node),
     )
-
     if actionable:
         print()
         for f in actionable:
-            badge = _colour(f.status, f"[{f.status}]", no_colour)
-            print(f"  {badge:<20} {f.node:<16} {f.check}")
-            print(f"           {'':16} {f.detail}")
+            badge = _colour(f.status, f"[{f.status:<4}]", no_colour)
+            print(f"  {badge}  {f.node:<16}  {f.check}")
+            print(f"           {'':16}  {f.detail}")
             if f.fix:
-                print(f"           {'':16} → {f.fix}")
+                print(f"           {'':16}  → {f.fix}")
             print()
     else:
         print(f"\n  {_colour('PASS', '✓ All checks passed!', no_colour)}\n")
-
-    print("─" * 64 + "\n")
+    print(f"{'─'*64}\n")
 
 
 def write_json(findings: List[Finding], output_dir: str,
                cluster_name: str, dse_version: str,
                nodes_checked: int, run_id: str) -> str:
-    counts = {s: 0 for s in ("PASS", "WARN", "FAIL", "INFO", "SKIP")}
-    for f in findings:
-        counts[f.status] = counts.get(f.status, 0) + 1
-
+    counts = {s: sum(1 for f in findings if f.status == s)
+              for s in ("PASS", "WARN", "FAIL", "INFO", "SKIP")}
     data = {
-        "run_id":       run_id,
-        "cluster_name": cluster_name,
-        "dse_version":  dse_version,
-        "nodes_checked": nodes_checked,
+        "run_id":         run_id,
+        "cluster_name":   cluster_name,
+        "dse_version":    dse_version,
+        "nodes_checked":  nodes_checked,
         "overall_status": _worst(findings),
-        "score":   _health_score(findings),
-        "summary": counts,
-        "findings": [f.as_dict() for f in findings],
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "score":          _score(findings),
+        "summary":        counts,
+        "generated_at":   datetime.datetime.utcnow().isoformat() + "Z",
         "recommendations": [
-            f"[{f.node}] {f.detail} → {f.fix}"
+            f"[{f.node}] {f.detail}  →  {f.fix}"
             for f in findings if f.status in ("FAIL", "WARN") and f.fix
         ][:20],
+        "findings": [f.as_dict() for f in findings],
     }
-
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"report_{run_id}.json")
     with open(path, "w") as fh:
@@ -1077,92 +1194,140 @@ def write_json(findings: List[Finding], output_dir: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Orchestrator
+# Orchestrator  — sequential gate-based flow per node
 # ─────────────────────────────────────────────────────────────────────────────
 
-ALL_MODULES = ["config", "cert", "trust", "tls", "match",
+ALL_MODULES = ["config", "cert", "chain", "trust", "tls", "match",
                "hostname", "jmx", "native", "opscenter",
                "ciphers", "versions", "restart", "logs"]
+
+
+def _step(label: str, fn, findings: List[Finding],
+          gate: bool = False, no_colour: bool = False) -> bool:
+    """
+    Run fn(), append results to findings.
+    If gate=True and any result is FAIL, print the blocking finding and return False.
+    Returns True if execution should continue.
+    """
+    results = fn()
+    findings.extend(results)
+    if gate and _has_fail(results):
+        for f in results:
+            if f.status == "FAIL":
+                badge = _colour("FAIL", "[FAIL]", no_colour)
+                print(f"  {badge}  {f.node}  {f.check}")
+                print(f"          {f.detail}")
+                if f.fix:
+                    print(f"          → {f.fix}")
+        return False
+    return True
+
+
+def validate_node(node: Node, active: set, args,
+                  findings: List[Finding]) -> None:
+    """
+    Run all active modules for one node in sequential gate order.
+    Stops at the first gated FAIL and prints remediation immediately.
+    """
+    nc = args.no_colour
+
+    def run(module: str, fn, gate: bool = False) -> bool:
+        if module not in active:
+            return True
+        return _step(f"[{node.name}] {module}", fn, findings, gate=gate, no_colour=nc)
+
+    # Stage 1 — config (gate: need paths/passwords to proceed)
+    if not run("config", lambda: check_config(node), gate=True):
+        return
+
+    # Stage 2 — cert (gate: cert must be valid before verifying chain)
+    if not run("cert", lambda: check_cert(node, args.warn_days, args.fail_days, args.timeout),
+               gate=True):
+        return
+
+    # Stage 3 — chain: root + intermediate CA verification (gate)
+    if not run("chain", lambda: check_chain(node, args.timeout), gate=True):
+        return
+
+    # Stage 4 — trust (gate: truststore must be sane before TLS tests)
+    if not run("trust", lambda: check_trust(node, args.timeout), gate=True):
+        return
+
+    # Stages 5–14 — run independently (no further gating per-node)
+    run("match",    lambda: check_cert_match(node, 7001, args.timeout))
+    run("hostname", lambda: check_hostname(node, args.timeout))
+    run("jmx",      lambda: check_jmx(node, args.timeout))
+    run("native",   lambda: check_native_ssl(node, args.timeout))
+    run("ciphers",  lambda: check_ciphers(node, args.timeout))
+    run("versions", lambda: check_versions(node))
+    run("restart",  lambda: check_restart(node, args.timeout))
+    run("logs",     lambda: check_logs(node, args.timeout))
 
 
 def run(args) -> int:
     nodes, ops_cfg, inv = load_inventory(args.inventory)
 
-    # Filter to requested nodes
     if args.nodes:
         allowed = {n.strip() for n in args.nodes.split(",")}
-        nodes = [n for n in nodes if n.name in allowed]
+        nodes   = [n for n in nodes if n.name in allowed]
     if not nodes:
         sys.exit("No nodes to validate.")
 
-    active = set(ALL_MODULES) if args.modules == "all" else \
-             {m.strip() for m in args.modules.split(",")}
+    active = (set(ALL_MODULES) if args.modules == "all"
+              else {m.strip() for m in args.modules.split(",")})
 
     cluster_name = inv.get("cluster_name", "DSECluster")
-    run_id = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    run_id       = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    work_dir     = tempfile.mkdtemp(prefix=f"dse-ssl-{run_id}-")
 
-    work_dir = tempfile.mkdtemp(prefix=f"dse-ssl-{run_id}-")
+    print(f"\nDSE SSL Validator  │  cluster={cluster_name}  "
+          f"│  nodes={len(nodes)}  │  modules={args.modules}")
+    print("─" * 64)
+
+    # ── Parallel collect ──────────────────────────────────────────────────────
+    print("Connecting to nodes...")
+    reachable: List[Node] = []
     all_findings: List[Finding] = []
 
-    print(f"\nDSE SSL Validator  |  cluster={cluster_name}  |  "
-          f"nodes={len(nodes)}  |  modules={args.modules}")
-    print(f"{'─'*64}")
-
-    # ── Collect (parallel SSH) ──────────────────────────────────────────────
-    print("Collecting node configs...")
-    reachable: List[Node] = []
-
-    def _collect(n):
-        print(f"  [{n.name}] connecting...")
-        f = collect(n, work_dir, args.timeout)
-        return n, f
+    def _collect(n: Node):
+        print(f"  [{n.name}] {n.host} ...", flush=True)
+        err = collect(n, work_dir, args.timeout)
+        return n, err
 
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        for n, f in ex.map(_collect, nodes):
-            all_findings.extend(f)
-            if not any(x.check == "ssh_connect" and x.status == "FAIL" for x in f):
+        for n, err in ex.map(_collect, nodes):
+            if err:
+                all_findings.append(err)
+                print(f"  [{n.name}] {_colour('FAIL', 'UNREACHABLE', args.no_colour)}: {err.detail}")
+            else:
                 reachable.append(n)
 
     if not reachable:
-        print("No nodes reachable via SSH.")
+        print("\nNo nodes reachable. Exiting.")
         sys.exit(2)
 
-    # ── Per-node module runs ────────────────────────────────────────────────
-    print(f"Running modules on {len(reachable)} node(s)...\n")
+    # ── Sequential gate-based validation per node ─────────────────────────────
+    print(f"\nValidating {len(reachable)} node(s) (sequential gate order)...\n")
     for n in reachable:
-        if "config"   in active: all_findings += check_config(n)
-        if "cert"     in active: all_findings += check_cert(n, args.warn_days, args.fail_days, args.timeout)
-        if "trust"    in active: all_findings += check_trust(n, args.timeout)
-        if "match"    in active: all_findings += check_cert_match(n, 7001, args.timeout)
-        if "hostname" in active: all_findings += check_hostname(n, args.timeout)
-        if "jmx"      in active: all_findings += check_jmx(n, args.timeout)
-        if "native"   in active: all_findings += check_native_ssl(n, args.timeout)
-        if "ciphers"  in active: all_findings += check_ciphers(n, args.timeout)
-        if "versions" in active: all_findings += check_versions(n, args.timeout)
-        if "restart"  in active: all_findings += check_restart(n, args.timeout)
-        if "logs"     in active: all_findings += check_logs(n, args.timeout)
+        print(f"  ── {n.name} ({n.host}) ──")
+        validate_node(n, active, args, all_findings)
 
-    # ── Cluster-level modules ───────────────────────────────────────────────
+    # ── Cluster-level checks ──────────────────────────────────────────────────
     if "config" in active and len(reachable) > 1:
         all_findings += check_config_consistency(reachable)
 
     if "tls" in active and len(reachable) > 1:
-        print("Running TLS mesh test...")
+        print("\nTLS mesh test (all node pairs)...")
         all_findings += check_tls_mesh(reachable, 7001, args.timeout, args.threads)
 
     if "opscenter" in active and ops_cfg:
         all_findings += check_opscenter(ops_cfg, reachable, args.timeout)
 
-    # ── Cleanup ────────────────────────────────────────────────────────────
-    import shutil
-    try:
-        shutil.rmtree(work_dir)
-    except Exception:
-        pass
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    shutil.rmtree(work_dir, ignore_errors=True)
 
-    # ── Report ─────────────────────────────────────────────────────────────
-    print_report(all_findings, no_colour=args.no_colour)
-
+    # ── Report ────────────────────────────────────────────────────────────────
+    print_report(all_findings, args.no_colour)
     json_path = write_json(all_findings, args.output, cluster_name,
                            reachable[0].dse_version if reachable else "unknown",
                            len(reachable), run_id)
@@ -1178,32 +1343,37 @@ def run(args) -> int:
 
 def main():
     p = argparse.ArgumentParser(
-        description="DSE SSL Validator — cluster SSL/TLS health checker",
+        description="DSE SSL Validator — sequential gate-based cluster SSL/TLS checker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Modules: {', '.join(ALL_MODULES)}\n"
-               "Exit: 0=PASS  1=WARN  2=FAIL",
+        epilog=(
+            "Validation order (each stage gates the next on FAIL):\n"
+            "  config → cert → chain → trust → tls → match → hostname\n"
+            "  → jmx → native → opscenter → ciphers → versions → restart → logs\n\n"
+            f"Modules: {', '.join(ALL_MODULES)}\n"
+            "Exit:    0=PASS  1=WARN  2=FAIL"
+        ),
     )
     p.add_argument("-i", "--inventory", required=True,
-                   help="Path to inventory.yml")
-    p.add_argument("-o", "--output",    default="reports/",
-                   help="Output directory for JSON report (default: reports/)")
-    p.add_argument("-m", "--modules",   default="all",
-                   help="Comma-separated modules or 'all' (default: all)")
-    p.add_argument("--nodes",           default="",
-                   help="Comma-separated node names to restrict run")
-    p.add_argument("--warn-days",       default=30, type=int,
-                   help="Cert expiry warning threshold in days (default: 30)")
-    p.add_argument("--fail-days",       default=7,  type=int,
-                   help="Cert expiry failure threshold in days (default: 7)")
-    p.add_argument("--timeout",         default=10, type=int,
-                   help="SSH/openssl timeout in seconds (default: 10)")
-    p.add_argument("--threads",         default=4,  type=int,
-                   help="Parallel SSH workers (default: 4)")
-    p.add_argument("--no-colour",       action="store_true",
+                   metavar="FILE",  help="Path to inventory.yml")
+    p.add_argument("-o", "--output",   default="reports/",
+                   metavar="DIR",   help="Output directory for JSON report  (default: reports/)")
+    p.add_argument("-m", "--modules",  default="all",
+                   metavar="LIST",  help="Comma-separated modules or 'all'  (default: all)")
+    p.add_argument("--nodes",          default="",
+                   metavar="LIST",  help="Comma-separated node names to restrict run")
+    p.add_argument("--warn-days",      default=30,  type=int,
+                   metavar="N",     help="Cert expiry warning threshold in days  (default: 30)")
+    p.add_argument("--fail-days",      default=7,   type=int,
+                   metavar="N",     help="Cert expiry failure threshold in days  (default: 7)")
+    p.add_argument("--timeout",        default=10,  type=int,
+                   metavar="SEC",   help="SSH / openssl timeout in seconds  (default: 10)")
+    p.add_argument("--threads",        default=4,   type=int,
+                   metavar="N",     help="Parallel SSH workers  (default: 4)")
+    p.add_argument("--no-colour",      action="store_true",
                    help="Disable ANSI colour output")
-    p.add_argument("--log-level",       default="WARNING",
+    p.add_argument("--log-level",      default="WARNING",
                    choices=["DEBUG", "INFO", "WARNING"],
-                   help="Logging verbosity (default: WARNING)")
+                   help="Logging verbosity  (default: WARNING)")
     args = p.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level),
