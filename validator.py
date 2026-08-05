@@ -657,16 +657,31 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         return findings
 
     # ── 3c. Export all truststore CAs (as dse_user) ──────────────────────────
-    alias_out, _ = ssh_run(node,
-        f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1 '
-        f'| grep "Alias name:" | sed "s/.*: //"',
+    # keytool -list (non-verbose) format: "alias, date, trustedCertEntry,"
+    # keytool -list -v format:            "Alias name: alias"
+    # We must handle BOTH formats. Use -v and parse "Alias name:" lines;
+    # also fall back to parsing the non-verbose flat lines for trustedCertEntry.
+    ts_list_out, _ = ssh_run(node,
+        f'keytool -list -v -keystore {ts} -storepass "{tspw}" -noprompt 2>&1',
         timeout, as_dse=True)
-    aliases = [a.strip() for a in alias_out.splitlines() if a.strip()]
+
+    # Parse verbose format ("Alias name: foo")
+    aliases = [m.strip() for m in re.findall(r"Alias name:\s*(.+)", ts_list_out)]
+
+    # Fallback: non-verbose flat format ("alias, date, trustedCertEntry,")
+    if not aliases:
+        for line in ts_list_out.splitlines():
+            if "trustedCertEntry" in line.lower():
+                candidate = line.split(",")[0].strip()
+                if candidate:
+                    aliases.append(candidate)
 
     if not aliases:
         findings.append(Finding(node.name, "truststore_empty", "FAIL",
                                 "Truststore contains no trusted certificate entries.",
-                                "Import the root (and intermediate) CA into the truststore."))
+                                "Import the root (and intermediate) CA into the truststore.\n"
+                                "  keytool -import -trustcacerts -alias root-ca "
+                                "-file ca.pem -keystore truststore.jks"))
         ssh_run(node, f"rm -f {tmp_leaf}", timeout)
         return findings
 
@@ -788,27 +803,36 @@ def check_trust(node: Node, timeout: int) -> List[Finding]:
         return [Finding(node.name, "trust_check", "SKIP",
                         "Truststore config missing — trust check skipped.")]
 
-    # Truststore password (as dse_user)
-    out, rc = ssh_run(node,
-        f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1 | head -3',
+    # ── Password + contents check in a single keytool call ───────────────────
+    # Do NOT use  | head -N  — entry lines come after the store header and
+    # would be cut off, causing false "truststore_empty" FAILs.
+    full_out, rc = ssh_run(node,
+        f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1',
         timeout, as_dse=True)
-    if "tampered" in out.lower() or "incorrect" in out.lower() or rc != 0:
+
+    lower = full_out.lower()
+    if rc != 0 or "tampered" in lower or "incorrect" in lower or "password" in lower:
         return [Finding(node.name, "truststore_password", "FAIL",
                         "Truststore password wrong or store corrupt.",
                         "Correct truststore_password in cassandra.yaml.")]
 
-    # Must contain at least one trustedCertEntry
-    if "trustedCertEntry" not in out:
-        full_out, _ = ssh_run(node,
-            f'keytool -list -keystore {ts} -storepass "{tspw}" -noprompt 2>&1',
-            timeout, as_dse=True)
-        if "trustedCertEntry" not in full_out:
-            return [Finding(node.name, "truststore_empty", "FAIL",
-                            "Truststore contains no trustedCertEntry.",
-                            "Import root CA (and intermediate if applicable) into truststore.")]
+    # Check both keytool output formats:
+    #   verbose:     "Entry type: trustedCertEntry"
+    #   non-verbose: "alias, date, trustedCertEntry,"
+    has_tce = "trustedcertentry" in lower
 
+    if not has_tce:
+        return [Finding(node.name, "truststore_empty", "FAIL",
+                        "Truststore contains no trustedCertEntry. "
+                        "Internode SSL requires the CA certificate(s) to be imported.",
+                        "keytool -import -trustcacerts -alias root-ca "
+                        "-file ca.pem -keystore truststore.jks -storepass <pass>")]
+
+    # Count entries for the INFO line
+    entry_count = full_out.lower().count("trustedcertentry")
     findings.append(Finding(node.name, "truststore", "PASS",
-                            "Truststore accessible and contains trusted CA entries."))
+                            f"Truststore accessible — {entry_count} trusted CA "
+                            f"entr{'y' if entry_count == 1 else 'ies'} found."))
     return findings
 
 
