@@ -13,6 +13,17 @@ python3 validator.py --local
 
 ---
 
+## Bug fixes (v2.1)
+
+| Issue | Root cause | Fix |
+|-------|-----------|-----|
+| `privkey_alg_unsupported` — *"Key algorithm '2048-BIT' is not supported"* | Regex `(\d+)[- ]bit` matched the key-size token (e.g. `2048-bit`) instead of the algorithm name | Two separate regex chains for algorithm and size; algorithm normalisation map |
+| `alias_type_mismatch` — *"Configured alias 'cassandra' not in keystore"* | Alias hardcoded to `cassandra` everywhere | `_ks_alias()` helper: auto-discovers first `PrivateKeyEntry` in keystore; no config required |
+| `cipher_suites_empty` reported as `WARN` | JVM default ciphers are secure in DSE 6.x; absence is not a problem | Downgraded to `INFO` |
+| `perms_keystore_owner` false FAIL when files are `cassandra:cassandra` but SSH user is `automaton` | Ownership check compared only `owner`, ignoring group; `stat` ran with `as_dse=True` | `stat` without privilege escalation; pass if `owner == dse_user` **or** `group == dse_user` |
+
+---
+
 ## Table of Contents
 
 1. [What it checks](#what-it-checks)
@@ -367,11 +378,13 @@ The most common cause of `UnrecoverableKeyException` and TLS handshake failures 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
 | `privkey_entry` | FAIL | Keystore has no `PrivateKeyEntry` — only `trustedCertEntry` |
-| `privkey_alias` | FAIL | Configured alias (`cassandra` by default) not in keystore — lists what aliases are present |
-| `privkey_algorithm` | INFO | Reports RSA or EC/ECDSA algorithm |
-| `privkey_alg_unsupported` | FAIL | Algorithm not supported by DSE JVM |
+| `privkey_alias` | FAIL | Auto-discovered or configured alias not in keystore — lists all available aliases |
+| `privkey_algorithm` | INFO | Reports RSA or EC algorithm detected from `keytool -v` output |
+| `privkey_alg_unsupported` | WARN | Algorithm cannot be determined from keytool output |
 | `privkey_size` | FAIL/WARN | RSA < 2048 bits = FAIL; RSA < 4096 = WARN; EC < 256 = FAIL |
 | `privkey_cert_match` | FAIL | Certificate exported under alias is unreadable — key/cert pair is mismatched or corrupt |
+
+> **Alias auto-discovery:** The tool automatically finds the first `PrivateKeyEntry` alias in the keystore. No need to set `server_encryption_options.alias` unless you have multiple keys and want to pin a specific one. This handles environments where the alias is `dse-node`, `mykey`, etc.
 
 ### Stage 16 — `alias` — Alias Inventory
 
@@ -381,11 +394,12 @@ keytool -list -v -keystore server-keystore.jks
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
-| `alias_inventory` | INFO | Lists all PKE + TCE aliases |
+| `alias_inventory` | INFO | Lists all PKE + TCE aliases discovered in the keystore |
 | `alias_no_pke` | FAIL | Zero `PrivateKeyEntry` aliases |
-| `alias_multiple_pke` | WARN | > 1 PKE — DSE loads wrong one unless `alias:` is set |
-| `alias_configured_ok` | PASS | Configured alias is a `PrivateKeyEntry` |
-| `alias_type_mismatch` | FAIL | Configured alias is a `trustedCertEntry` |
+| `alias_multiple_pke` | WARN | > 1 PKE — tool uses first one; set `alias:` in cassandra.yaml to pin |
+| `alias_pke_count` | PASS | Exactly one `PrivateKeyEntry` found |
+| `alias_configured_ok` | PASS | Auto-discovered alias is a `PrivateKeyEntry` |
+| `alias_type_mismatch` | FAIL | `alias:` in cassandra.yaml points to a `trustedCertEntry`, not a private key |
 | `alias_chain_missing` | FAIL | Chain length = 0 — no certificate attached to the private key |
 | `alias_chain_incomplete` | WARN | Chain length = 1 — intermediate CA missing |
 | `truststore_dup_certs` | WARN | Same SHA1 fingerprint under two different aliases |
@@ -396,12 +410,14 @@ Checked on: keystore, truststore, `cassandra.yaml`
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
-| `perms_<file>_owner` | FAIL | File not owned by `dse_user` — DSE cannot open it |
+| `perms_<file>_owner` | WARN | File owner AND group are both different from `dse_user` |
 | `perms_<file>_mode` | FAIL | World-readable or world-writable (`o+r` or `o+w`) |
 | `perms_<file>_mode` | WARN | Group-writable (`g+w`) or execute bits set |
 | `selinux_<file>` | WARN | `unlabeled_t` or `default_t` SELinux context — `restorecon` required |
 
 Correct state: `chown cassandra:cassandra <file> && chmod 600 <file>`
+
+> **Ownership logic:** Ownership passes if `owner == dse_user` **or** `group == dse_user`. So `-rw------- cassandra:cassandra` with `dse_user: cassandra` is always PASS, even when SSH runs as `automaton`.
 
 ### Stage 18 — `integrity` — Store Integrity
 

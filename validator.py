@@ -347,6 +347,44 @@ def _enc(node: Node) -> dict:
     return node.yaml_data.get("server_encryption_options") or {}
 
 
+def _ks_alias(node: Node, timeout: int, as_dse: bool = True) -> str:
+    """
+    Return the alias to use for keytool operations.
+
+    Resolution order (to handle every customer environment):
+      1. server_encryption_options.alias  (explicitly configured)
+      2. First PrivateKeyEntry found in the keystore  (auto-discover)
+      3. Fallback: 'cassandra'  (historical DSE default)
+
+    This means the tool works correctly regardless of what alias the
+    customer used when creating the keystore (dse-node, myalias, etc.)
+    without requiring any extra configuration.
+    """
+    enc = _enc(node)
+    # 1. Explicitly configured alias wins
+    if enc.get("alias"):
+        return enc["alias"].strip()
+
+    ks  = enc.get("keystore", "")
+    pwd = enc.get("keystore_password", "")
+    if not ks or not pwd:
+        return "cassandra"
+
+    # 2. Auto-discover the first PrivateKeyEntry alias
+    out, rc = ssh_run(node,
+        f'keytool -list -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
+        timeout, as_dse=as_dse)
+    if rc == 0:
+        # keytool -list (non-verbose) format: "alias, date, PrivateKeyEntry, ..."
+        for line in out.splitlines():
+            if "PrivateKeyEntry" in line:
+                candidate = line.split(",")[0].strip()
+                if candidate:
+                    return candidate
+    # 3. Default
+    return "cassandra"
+
+
 def _parse_date(text: str) -> Optional[datetime.datetime]:
     for fmt in ("%a %b %d %H:%M:%S %Z %Y", "%a %b %d %H:%M:%S %Y", "%B %d, %Y"):
         try:
@@ -434,11 +472,12 @@ def check_config(node: Node) -> List[Finding]:
                                 "server_encryption_options.optional=true — plaintext connections allowed.",
                                 "Set optional: false in production."))
 
-    # cipher_suites
+    # cipher_suites — absence is fine; JVM defaults (TLS_AES_128_GCM_SHA256 etc.)
+    # work correctly in DSE 6.x.  Only report as INFO so the operator is aware.
     if not enc.get("cipher_suites"):
-        findings.append(Finding(node.name, "cipher_suites_empty", "WARN",
-                                "cipher_suites not set — JVM defaults will be used.",
-                                "Explicitly set cipher_suites for consistent behaviour."))
+        findings.append(Finding(node.name, "cipher_suites_empty", "INFO",
+                                "cipher_suites not set — JVM default cipher list will be used. "
+                                "This is acceptable; set explicitly only for strict compliance."))
 
     # client_encryption_options
     cenc = node.yaml_data.get("client_encryption_options") or {}
@@ -604,15 +643,17 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
                                 f"Certificate chain depth: {depth} (leaf + {depth-1} CA(s))."))
 
     # ── 3b. Export leaf cert from keystore (as dse_user) ─────────────────────
+    leaf_alias = _ks_alias(node, timeout)
     tmp_leaf = f"/tmp/_dse_leaf_{node.name}.pem"
     _, rc = ssh_run(node,
-        f'keytool -exportcert -alias cassandra -keystore {ks} '
+        f'keytool -exportcert -alias "{leaf_alias}" -keystore {ks} '
         f'-storepass "{kspw}" -rfc -file {tmp_leaf} 2>/dev/null',
         timeout, as_dse=True)
     if rc != 0:
         findings.append(Finding(node.name, "chain_export", "WARN",
-                                "Could not export leaf cert from keystore (alias 'cassandra' missing?)",
-                                "Check that the alias in server_encryption_options.keystore is 'cassandra'."))
+                                f"Could not export leaf cert from keystore (tried alias '{leaf_alias}'). "
+                                "Set server_encryption_options.alias in cassandra.yaml if the alias differs.",
+                                "keytool -list -keystore <ks> to see available aliases."))
         return findings
 
     # ── 3c. Export all truststore CAs (as dse_user) ──────────────────────────
@@ -908,9 +949,10 @@ def check_cert_match(node: Node, port: int, timeout: int) -> List[Finding]:
     if not ks or not pwd:
         return []
 
+    alias = _ks_alias(node, timeout)
     tmp = f"/tmp/_dse_cm_{node.name}.pem"
     ssh_run(node,
-        f'keytool -exportcert -alias cassandra -keystore {ks} '
+        f'keytool -exportcert -alias "{alias}" -keystore {ks} '
         f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout, as_dse=True)
     ks_fp_out, _  = ssh_run(node,
         f"openssl x509 -noout -fingerprint -sha256 -in {tmp} 2>/dev/null", timeout)
@@ -949,9 +991,10 @@ def check_hostname(node: Node, timeout: int) -> List[Finding]:
     if not ks or not pwd:
         return []
 
+    alias = _ks_alias(node, timeout)
     tmp = f"/tmp/_dse_hn_{node.name}.pem"
     ssh_run(node,
-        f'keytool -exportcert -alias cassandra -keystore {ks} '
+        f'keytool -exportcert -alias "{alias}" -keystore {ks} '
         f'-storepass "{pwd}" -rfc -file {tmp} 2>/dev/null', timeout, as_dse=True)
     san_out, _ = ssh_run(node,
         f"openssl x509 -noout -subject -ext subjectAltName -in {tmp} 2>/dev/null", timeout)
@@ -1321,12 +1364,13 @@ def check_privkey(node: Node, timeout: int) -> List[Finding]:
     enc = _enc(node)
     ks   = enc.get("keystore", "")
     pwd  = enc.get("keystore_password", "")
-    # DSE uses 'cassandra' as the default alias; some deployments override it
-    alias = enc.get("alias", "cassandra")
 
     if not ks or not pwd:
         return [Finding(node.name, "privkey", "SKIP",
                         "Keystore config missing — private key check skipped.")]
+
+    # Auto-discover alias — works for any customer alias (dse-node, mykey, etc.)
+    alias = _ks_alias(node, timeout)
 
     # ── 15a. Confirm PrivateKeyEntry exists ──────────────────────────────────
     kt_out, rc = ssh_run(node,
@@ -1369,26 +1413,41 @@ def check_privkey(node: Node, timeout: int) -> List[Finding]:
                                 f"Alias '{alias}' exists in keystore."))
 
     # ── 15c. Key algorithm and size (from keytool -v output) ─────────────────
-    # keytool prints: "Key type: RSA"  and  "Key size: 2048"  (Java 11+)
-    # or embedded in "Public Key Algorithm: RSAwithSHA256"  (older Java)
-    alg_m  = re.search(r"Key type:\s*(\S+)",                  kt_out, re.I)
-    size_m = re.search(r"Key size:\s*(\d+)",                   kt_out, re.I)
-    # Fallback: parse from Subject Public Key Info block
-    if not alg_m:
-        alg_m = re.search(r"Public Key Algorithm:\s*(\S+)",   kt_out, re.I)
-    if not size_m:
-        size_m = re.search(r"(\d+)[- ]bit",                   kt_out, re.I)
+    # Java 11+  prints separate "Key type: RSA"  and "Key size: 2048" lines.
+    # Older Java embeds it in "Public Key Algorithm: RSAEncryption" or
+    # "Subject Public Key Algorithm: EC" lines.
+    # IMPORTANT: parse algorithm and size with separate, non-overlapping
+    # patterns to avoid the fallback r"(\d+)[- ]bit" accidentally matching
+    # a size string like "2048-bit" and treating it as the algorithm name.
 
-    alg  = alg_m.group(1).upper()  if alg_m  else "UNKNOWN"
-    size = int(size_m.group(1))    if size_m  else 0
+    # 1. Algorithm
+    alg_m = (re.search(r"Key type:\s*(\S+)", kt_out, re.I) or
+             re.search(r"Public Key Algorithm:\s*(RSA|EC|DSA|EdDSA)\b", kt_out, re.I))
+    raw_alg = alg_m.group(1).strip().upper() if alg_m else ""
+
+    # Normalise common variants  →  RSA / EC / DSA
+    _ALG_MAP = {
+        "RSAENCRYPTION": "RSA", "RSASSA-PSS": "RSA",
+        "EC": "EC", "ECDSA": "EC", "ECPUBLICKEY": "EC",
+        "DSA": "DSA", "EDDSA": "EdDSA",
+    }
+    alg = _ALG_MAP.get(raw_alg, raw_alg) if raw_alg else "UNKNOWN"
+
+    # 2. Key size — dedicated patterns only, never the generic bit-size fallback
+    size_m = (re.search(r"Key size:\s*(\d+)", kt_out, re.I) or
+              re.search(r"(\d+)[- ]?bit (?:RSA|EC|DSA)", kt_out, re.I) or
+              re.search(r"(?:RSA|EC|DSA)[- ](\d+)", kt_out, re.I))
+    size = int(size_m.group(1)) if size_m else 0
 
     findings.append(Finding(node.name, "privkey_algorithm", "INFO",
-                            f"Private key algorithm: {alg}  size: {size} bits"))
+                            f"Private key algorithm: {alg}  size: {size if size else '?'} bits"))
 
-    if alg not in ("RSA", "EC", "ECDSA", "UNKNOWN"):
-        findings.append(Finding(node.name, "privkey_alg_unsupported", "FAIL",
-                                f"Key algorithm '{alg}' is not supported by DSE.",
-                                "Use RSA (≥2048 bit) or EC/ECDSA (≥256 bit) keys."))
+    # DSE supports RSA and EC keys; DSA is accepted by Java but not recommended
+    _UNSUPPORTED = {"UNKNOWN"}   # only flag truly unrecognised algorithms
+    if alg in _UNSUPPORTED:
+        findings.append(Finding(node.name, "privkey_alg_unsupported", "WARN",
+                                "Could not determine key algorithm from keytool output.",
+                                "Run: keytool -list -v -keystore <ks> and check 'Key type'."))
     elif alg == "RSA" and size > 0:
         if size < 2048:
             findings.append(Finding(node.name, "privkey_size", "FAIL",
@@ -1400,7 +1459,7 @@ def check_privkey(node: Node, timeout: int) -> List[Finding]:
         else:
             findings.append(Finding(node.name, "privkey_size", "PASS",
                                     f"RSA key size {size} bits — meets recommendation."))
-    elif alg in ("EC", "ECDSA") and size > 0:
+    elif alg == "EC" and size > 0:
         if size < 256:
             findings.append(Finding(node.name, "privkey_size", "FAIL",
                                     f"EC key size {size} bits is below the 256-bit minimum.",
@@ -1477,8 +1536,6 @@ def check_alias(node: Node, timeout: int) -> List[Finding]:
     pwd  = enc.get("keystore_password", "")
     ts   = enc.get("truststore", "")
     tspw = enc.get("truststore_password", "")
-    configured_alias = enc.get("alias", "cassandra")
-
     if not ks or not pwd:
         return [Finding(node.name, "alias", "SKIP",
                         "Keystore config missing — alias check skipped.")]
@@ -1490,6 +1547,9 @@ def check_alias(node: Node, timeout: int) -> List[Finding]:
     if rc != 0:
         return [Finding(node.name, "alias", "SKIP",
                         "Keystore not readable — alias check skipped.")]
+
+    # configured_alias: from cassandra.yaml alias field if set, else auto-discover
+    configured_alias = _ks_alias(node, timeout)
 
     # ── 16a. Count PrivateKeyEntry vs trustedCertEntry ───────────────────────
     pke_aliases = re.findall(r"Alias name:\s*(.+?)\n.*?Entry type:\s*PrivateKeyEntry",
@@ -1614,10 +1674,11 @@ def check_perms(node: Node, timeout: int) -> List[Finding]:
         if not path:
             continue
 
-        # stat: %U=owner %G=group %a=octal_perms %n=name
+        # stat is world-executable so no as_dse needed; avoids false negatives
+        # when dse_user is the sudo target, not the current user.
         stat_out, rc = ssh_run(node,
-            f"stat -c '%U %G %a %n' {path} 2>/dev/null || echo MISSING",
-            timeout, as_dse=True)
+            f"stat -c '%U %G %a' {path} 2>/dev/null || echo MISSING",
+            timeout, as_dse=False)
 
         if "MISSING" in stat_out or rc != 0:
             findings.append(Finding(node.name, f"perms_{label}", "WARN",
@@ -1634,15 +1695,19 @@ def check_perms(node: Node, timeout: int) -> List[Finding]:
         owner, group, mode_octal = parts[0], parts[1], parts[2]
 
         # ── Ownership check ──────────────────────────────────────────────────
-        if owner != dse_user:
+        # Accept owner == dse_user OR group == dse_user (group-read with 640 is valid)
+        # Also accept when dse_user is empty (single-user or local mode)
+        owner_ok = (not dse_user or owner == dse_user or group == dse_user)
+        if not owner_ok:
             findings.append(Finding(
-                node.name, f"perms_{label}_owner", "FAIL",
-                f"{label} owned by '{owner}' but expected '{dse_user}'.",
+                node.name, f"perms_{label}_owner", "WARN",
+                f"{label} owner='{owner}' group='{group}' — "
+                f"expected owner or group to be '{dse_user}'.",
                 f"Fix: chown {dse_user}:{dse_user} {path}",
             ))
         else:
             findings.append(Finding(node.name, f"perms_{label}_owner", "PASS",
-                                    f"{label} owner='{owner}' — correct."))
+                                    f"{label} owner='{owner}' group='{group}' — correct."))
 
         # ── Permission check ─────────────────────────────────────────────────
         try:
@@ -1858,7 +1923,7 @@ def check_revocation(node: Node, timeout: int) -> List[Finding]:
     pwd = enc.get("keystore_password", "")
     ts  = enc.get("truststore", "")
     tspw = enc.get("truststore_password", "")
-    alias = enc.get("alias", "cassandra")
+    alias = _ks_alias(node, timeout)
 
     if not ks or not pwd:
         return [Finding(node.name, "revocation", "SKIP",
