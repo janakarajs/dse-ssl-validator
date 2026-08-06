@@ -1823,19 +1823,12 @@ def check_integrity(node: Node, timeout: int) -> List[Finding]:
                         "No keystore/truststore configured — integrity check skipped.")]
 
     for store_path, store_pwd, store_label in stores:
-        # ── 18a. File readable ───────────────────────────────────────────────
-        exist_out, _ = ssh_run(node,
-            f"test -f {store_path} && test -r {store_path} && echo OK || echo FAIL",
-            timeout, as_dse=True)
-        if "FAIL" in exist_out or "OK" not in exist_out:
-            findings.append(Finding(
-                node.name, f"integrity_{store_label}_readable", "FAIL",
-                f"{store_label} at {store_path} is missing or unreadable by '{node.dse_user or node.ssh_user}'.",
-                f"Check file existence and permissions: ls -la {store_path}",
-            ))
-            continue
-
-        # ── 18b. Password + integrity (keytool -list) ────────────────────────
+        # ── 18a+18b. Readability + password — single keytool call ────────────
+        # Do NOT use "test -r" as a pre-check — it runs as the SSH login user
+        # (automaton), not as dse_user (cassandra), so it always fails for
+        # files owned cassandra:cassandra 600.
+        # keytool -list AS dse_user is the single authoritative readability
+        # and password test: if it succeeds, the file exists and is readable.
         kt_out, kt_rc = ssh_run(node,
             f'keytool -list -v -keystore {store_path} -storepass "{store_pwd}" '
             f'-noprompt 2>&1',
@@ -1843,17 +1836,32 @@ def check_integrity(node: Node, timeout: int) -> List[Finding]:
 
         if kt_rc != 0:
             lower = kt_out.lower()
-            if "tampered" in lower or "incorrect" in lower or "password" in lower:
+            if "no such file" in lower or "does not exist" in lower or not kt_out.strip():
+                findings.append(Finding(
+                    node.name, f"integrity_{store_label}_readable", "FAIL",
+                    f"{store_label} not found at {store_path}.",
+                    f"Verify the path in cassandra.yaml server_encryption_options. "
+                    f"Check: ls -la {store_path}",
+                ))
+            elif "tampered" in lower or "incorrect" in lower or "password" in lower:
                 findings.append(Finding(
                     node.name, f"integrity_{store_label}_password", "FAIL",
                     f"{store_label} password is wrong or the store is tampered.",
                     f"Correct {store_label}_password in cassandra.yaml, "
                     "or re-create the store.",
                 ))
+            elif "permission denied" in lower or "access" in lower:
+                dse_u = node.dse_user or node.ssh_user
+                findings.append(Finding(
+                    node.name, f"integrity_{store_label}_readable", "FAIL",
+                    f"{store_label} at {store_path} is not readable by '{dse_u}'. "
+                    f"File permissions: run 'ls -la {store_path}' on the node.",
+                    f"Fix: sudo chown {dse_u}:{dse_u} {store_path} && sudo chmod 640 {store_path}",
+                ))
             else:
                 findings.append(Finding(
                     node.name, f"integrity_{store_label}_corrupt", "FAIL",
-                    f"{store_label} could not be read: {kt_out.strip()[:120]}",
+                    f"{store_label} could not be opened: {kt_out.strip()[:120]}",
                     f"Re-create the {store_label} from source certificates.",
                 ))
             continue
