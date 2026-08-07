@@ -435,22 +435,45 @@ def _ks_alias(node: Node, timeout: int, as_dse: bool = True) -> str:
         node._ks_alias_cache = "cassandra"
         return node._ks_alias_cache
 
-    # 2. Auto-discover — reuse cached verbose keytool output if available
+    # 2. Auto-discover — two formats to handle:
+    #    a) Non-verbose `keytool -list` → lines like:
+    #         dse-node, Jan 1 2025, PrivateKeyEntry, ...
+    #    b) Verbose `keytool -list -v` → two separate lines:
+    #         Alias name: dse-node
+    #         Entry type: PrivateKeyEntry
+    #
+    # When the cache holds verbose output we must NOT split on "," because the
+    # "Entry type: PrivateKeyEntry" line also contains "PrivateKeyEntry" — that
+    # would return "Entry type: PrivateKeyEntry" as the alias name.
+    # Strategy: use _kt_verbose_cache (verbose) and look for "Alias name:" lines
+    # that are immediately followed (within a few lines) by "PrivateKeyEntry".
+    # Fall back to a fresh non-verbose keytool call if the cache is absent.
+
     kt_out = node._kt_verbose_cache
-    if not kt_out:
-        kt_out, rc = ssh_run(node,
+    if kt_out:
+        # Verbose format: find "Alias name: X" blocks where entry type is PKE
+        pke_aliases = re.findall(
+            r"Alias name:\s*(.+?)\n(?:.*\n){0,4}.*Entry type:\s*PrivateKeyEntry",
+            kt_out, re.I)
+        if pke_aliases:
+            node._ks_alias_cache = pke_aliases[0].strip()
+            return node._ks_alias_cache
+    else:
+        # Non-verbose format: each entry is one comma-separated line
+        #   alias, date, entrytype[, fingerprint]
+        nonv_out, rc = ssh_run(node,
             f'keytool -list -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
             timeout, as_dse=as_dse)
         if rc != 0:
             node._ks_alias_cache = "cassandra"
             return node._ks_alias_cache
-
-    for line in kt_out.splitlines():
-        if "PrivateKeyEntry" in line:
-            candidate = line.split(",")[0].strip()
-            if candidate:
-                node._ks_alias_cache = candidate
-                return node._ks_alias_cache
+        for line in nonv_out.splitlines():
+            if "PrivateKeyEntry" in line:
+                candidate = line.split(",")[0].strip()
+                # Guard: alias should not look like a keytool label
+                if candidate and not candidate.lower().startswith(("alias", "entry", "keystore")):
+                    node._ks_alias_cache = candidate
+                    return node._ks_alias_cache
 
     # 3. Default
     node._ks_alias_cache = "cassandra"
@@ -1267,10 +1290,14 @@ def check_jmx(node: Node, timeout: int) -> List[Finding]:
         "ps -ef | grep -E 'jmxremote|Djavax.net.ssl' | grep -v grep 2>/dev/null || true",
         timeout)
     jmx_ssl = "jmxremote.ssl=true" in ps_out
+    # JMX SSL is separate from internode/client SSL — absence is advisory only.
+    # DSE can operate with JMX SSL disabled (especially in private subnets).
+    # Downgraded to INFO so it doesn't noise up support ticket triage.
     findings.append(Finding(node.name, "jmx_ssl_flag",
-                            "PASS" if jmx_ssl else "WARN",
+                            "PASS" if jmx_ssl else "INFO",
                             f"jmxremote.ssl={'true' if jmx_ssl else 'false/absent'}.",
-                            "Add -Dcom.sun.management.jmxremote.ssl=true to cassandra-env.sh." if not jmx_ssl else ""))
+                            "Consider adding -Dcom.sun.management.jmxremote.ssl=true "
+                            "to cassandra-env.sh if JMX is exposed externally." if not jmx_ssl else ""))
 
     tcp_out, _ = ssh_run(node, "nc -zv -w5 localhost 7199 2>&1 || echo CLOSED", timeout)
     if "CLOSED" in tcp_out or "refused" in tcp_out.lower():
@@ -1890,21 +1917,25 @@ def check_perms(node: Node, timeout: int) -> List[Finding]:
     enc      = _enc(node)
     dse_user = node.dse_user or node.ssh_user
 
+    # cassandra.yaml is a config file (not a key material file) — DSE ships it
+    # world-readable (0644) by design so tools like dsetool/nodetool can read it.
+    # Flagging it as world-readable produces noise without security value.
     files_to_check = [
         (enc.get("keystore",   ""), "keystore"),
         (enc.get("truststore", ""), "truststore"),
-        (node.cassandra_yaml,       "cassandra.yaml"),
     ]
 
     for path, label in files_to_check:
         if not path:
             continue
 
-        # stat is world-executable so no as_dse needed; avoids false negatives
-        # when dse_user is the sudo target, not the current user.
+        # Run stat as dse_user so symlinks and ACLs that only the DSE user can
+        # follow are resolved correctly.  This avoids false "file not found"
+        # findings when the keystore lives under a dse_user-owned directory that
+        # the SSH user cannot traverse.
         stat_out, rc = ssh_run(node,
             f"stat -c '%U %G %a' {path} 2>/dev/null || echo MISSING",
-            timeout, as_dse=False)
+            timeout, as_dse=True)
 
         if "MISSING" in stat_out or rc != 0:
             findings.append(Finding(node.name, f"perms_{label}", "WARN",
