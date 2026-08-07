@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 DSE SSL Validator
 -----------------
@@ -119,6 +120,14 @@ try:
     import yaml
 except ImportError:
     sys.exit("PyYAML not installed. Run: pip install pyyaml")
+
+# Force UTF-8 output so that → and — render correctly regardless of the
+# terminal locale (common issue on RHEL/CentOS nodes with LANG=C or legacy
+# Windows terminals that default to cp1252/latin-1).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 log = logging.getLogger(__name__)
 
@@ -501,14 +510,17 @@ def _warm_caches(node: Node, timeout: int) -> None:
             timeout, as_dse=True)
         if rc == 0:
             node._kt_verbose_cache = out
-            # Also seed the alias cache from the verbose output
+            # Seed alias cache from verbose output using the correct verbose format:
+            #   Alias name: dse-node          ← what we want
+            #   Creation date: ...
+            #   Entry type: PrivateKeyEntry   ← NOT the alias
+            # Must NOT split on "," here — verbose output lines are not CSV.
             if not node._ks_alias_cache and not enc.get("alias"):
-                for line in out.splitlines():
-                    if "PrivateKeyEntry" in line:
-                        candidate = line.split(",")[0].strip()
-                        if candidate:
-                            node._ks_alias_cache = candidate
-                            break
+                pke = re.findall(
+                    r"Alias name:\s*(.+?)\n(?:.*\n){0,4}.*Entry type:\s*PrivateKeyEntry",
+                    out, re.I)
+                if pke:
+                    node._ks_alias_cache = pke[0].strip()
 
     if ts and tspw and not node._ts_verbose_cache:
         out, rc = ssh_run(node,
