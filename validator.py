@@ -765,12 +765,51 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         return [Finding(node.name, "chain_check", "SKIP",
                         "Missing keystore/truststore config — chain check skipped.")]
 
-    # ── 3a. Chain depth from keytool (as dse_user) ───────────────────────────
-    kt_out, _ = ssh_run(node,
-        f'keytool -list -v -keystore {ks} -storepass "{kspw}" -noprompt 2>&1',
+    # ── 3a. Export leaf cert (needed for self-signed detection) ──────────────
+    leaf_alias = _ks_alias(node, timeout)
+    tmp_leaf   = f"/tmp/_dse_leaf_{node.name}.pem"
+    _, rc = ssh_run(node,
+        f'keytool -exportcert -alias "{leaf_alias}" -keystore {ks} '
+        f'-storepass "{kspw}" -rfc -file {tmp_leaf} 2>/dev/null',
         timeout, as_dse=True)
+    if rc != 0:
+        findings.append(Finding(node.name, "chain_export", "WARN",
+                                f"Could not export leaf cert from keystore "
+                                f"(tried alias '{leaf_alias}'). "
+                                "Set server_encryption_options.alias in cassandra.yaml "
+                                "if the alias differs.",
+                                "keytool -list -keystore <ks> to see available aliases."))
+        return findings
 
-    # Count "Certificate[N]" markers; fall back to PEM header count
+    # ── 3b. Determine whether the leaf is self-signed ────────────────────────
+    # Self-signed: Subject DN == Issuer DN (the cert is its own CA).
+    # Fingerprint is used for trust verification instead of issuer DN lookup.
+    leaf_info_out, _ = ssh_run(node,
+        f"openssl x509 -noout -subject -issuer -fingerprint -sha256 -in {tmp_leaf} 2>/dev/null",
+        timeout)
+    leaf_subj_m  = re.search(r"subject=(.+)", leaf_info_out)
+    leaf_issr_m  = re.search(r"issuer=(.+)",  leaf_info_out)
+    leaf_fp_m    = re.search(r"SHA256 Fingerprint=([0-9A-Fa-f:]+)", leaf_info_out)
+
+    leaf_subj = leaf_subj_m.group(1).strip() if leaf_subj_m else ""
+    leaf_issr = leaf_issr_m.group(1).strip() if leaf_issr_m else ""
+    leaf_fp   = leaf_fp_m.group(1).upper().replace(":", "") if leaf_fp_m else ""
+
+    def _norm_dn(dn: str) -> str:
+        """Normalise a DN for comparison: lowercase, remove spaces around '='/',' ."""
+        return re.sub(r"\s*([=,])\s*", r"\1", dn.strip().lower())
+
+    is_self_signed = bool(leaf_subj and leaf_issr and
+                          _norm_dn(leaf_subj) == _norm_dn(leaf_issr))
+
+    # ── 3b-2. Chain depth from keytool ───────────────────────────────────────
+    # Reuse verbose cache if available; otherwise fetch now.
+    kt_out = node._kt_verbose_cache or ""
+    if not kt_out:
+        kt_out, _ = ssh_run(node,
+            f'keytool -list -v -keystore {ks} -storepass "{kspw}" -noprompt 2>&1',
+            timeout, as_dse=True)
+
     depth = len(re.findall(r"Certificate\[\d+\]", kt_out))
     if depth == 0:
         depth = len(re.findall(r"-----BEGIN CERTIFICATE-----", kt_out))
@@ -780,37 +819,24 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
                                 "Could not determine certificate chain depth.",
                                 "Run: keytool -list -v -keystore <ks> to inspect manually."))
     elif depth == 1:
-        findings.append(Finding(node.name, "chain_depth", "WARN",
-                                "Only 1 certificate in keystore — intermediate CA missing.",
-                                "Import full chain: leaf + intermediate + root into keystore."))
+        if is_self_signed:
+            # depth=1 is correct for self-signed — not a missing intermediate
+            findings.append(Finding(node.name, "chain_depth", "INFO",
+                                    "Certificate chain depth: 1 (self-signed — no intermediate CA)."))
+        else:
+            findings.append(Finding(node.name, "chain_depth", "WARN",
+                                    "Only 1 certificate in keystore — intermediate CA may be missing.",
+                                    "Import full chain: leaf + intermediate + root into keystore."))
     else:
         findings.append(Finding(node.name, "chain_depth", "INFO",
                                 f"Certificate chain depth: {depth} (leaf + {depth-1} CA(s))."))
 
-    # ── 3b. Export leaf cert from keystore (as dse_user) ─────────────────────
-    leaf_alias = _ks_alias(node, timeout)
-    tmp_leaf = f"/tmp/_dse_leaf_{node.name}.pem"
-    _, rc = ssh_run(node,
-        f'keytool -exportcert -alias "{leaf_alias}" -keystore {ks} '
-        f'-storepass "{kspw}" -rfc -file {tmp_leaf} 2>/dev/null',
-        timeout, as_dse=True)
-    if rc != 0:
-        findings.append(Finding(node.name, "chain_export", "WARN",
-                                f"Could not export leaf cert from keystore (tried alias '{leaf_alias}'). "
-                                "Set server_encryption_options.alias in cassandra.yaml if the alias differs.",
-                                "keytool -list -keystore <ks> to see available aliases."))
-        return findings
-
-    # ── 3c. Export all truststore CAs (as dse_user) ──────────────────────────
-    # keytool -list (non-verbose) format: "alias, date, trustedCertEntry,"
-    # keytool -list -v format:            "Alias name: alias"
-    # We must handle BOTH formats. Use -v and parse "Alias name:" lines;
-    # also fall back to parsing the non-verbose flat lines for trustedCertEntry.
+    # ── 3c. Export all truststore entries ────────────────────────────────────
     ts_list_out, _ = ssh_run(node,
         f'keytool -list -v -keystore {ts} -storepass "{tspw}" -noprompt 2>&1',
         timeout, as_dse=True)
 
-    # Parse verbose format ("Alias name: foo")
+    # Parse verbose format ("Alias name: foo") — correct for both JKS and PKCS12
     aliases = [m.strip() for m in re.findall(r"Alias name:\s*(.+)", ts_list_out)]
 
     # Fallback: non-verbose flat format ("alias, date, trustedCertEntry,")
@@ -818,67 +844,122 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         for line in ts_list_out.splitlines():
             if "trustedCertEntry" in line.lower():
                 candidate = line.split(",")[0].strip()
-                if candidate:
+                if candidate and not candidate.lower().startswith(
+                        ("alias", "entry", "keystore")):
                     aliases.append(candidate)
 
     if not aliases:
         findings.append(Finding(node.name, "truststore_empty", "FAIL",
                                 "Truststore contains no trusted certificate entries.",
-                                "Import the root (and intermediate) CA into the truststore.\n"
+                                "Import the root (and intermediate) CA into the truststore:\n"
                                 "  keytool -import -trustcacerts -alias root-ca "
                                 "-file ca.pem -keystore truststore.jks"))
         ssh_run(node, f"rm -f {tmp_leaf}", timeout)
         return findings
 
-    # ── 3c-extra. Issuer ↔ truststore cross-check ────────────────────────────
-    # Verify the cert's Issuer DN is represented in the truststore.
-    # If missing, DSE cannot verify peer certificates → handshake failure.
-    issuer_out, _ = ssh_run(node,
-        f"openssl x509 -noout -issuer -in {tmp_leaf} 2>/dev/null", timeout)
-    issuer_m = re.search(r"issuer=(.+)", issuer_out)
-    issuer_dn = issuer_m.group(1).strip() if issuer_m else ""
+    # ── 3c-extra. Trust verification — fingerprint-based for self-signed, ────
+    # DN-based for CA-signed.  This eliminates the false positive where the    ─
+    # issuer DN matches the subject (self-signed) but the truststore lookup    ─
+    # correctly uses the cert's own fingerprint rather than a separate CA.     ─
+    findings.append(Finding(node.name, "cert_issuer", "INFO",
+                            f"Cert Subject: {leaf_subj}  |  "
+                            f"Issuer: {leaf_issr}  |  "
+                            f"Self-signed: {is_self_signed}"))
 
-    if issuer_dn:
-        findings.append(Finding(node.name, "cert_issuer", "INFO",
-                                f"Cert Issuer DN: {issuer_dn}"))
-        # Extract all Owner/Subject lines from the verbose truststore listing
+    if is_self_signed:
+        # ── Self-signed path: verify the identical cert is in the truststore ─
+        # Compare SHA-256 fingerprints; this is format-agnostic and handles
+        # alias name differences, DN formatting variations, and JKS vs PKCS12.
+        ts_fp_matched = False
+        if leaf_fp:
+            # Extract fingerprint of every trustedCertEntry by exporting each
+            # alias and comparing fingerprints
+            for alias in aliases:
+                ts_pem, ts_rc = ssh_run(node,
+                    f'keytool -exportcert -alias "{alias}" -keystore {ts} '
+                    f'-storepass "{tspw}" -rfc 2>/dev/null',
+                    timeout, as_dse=True)
+                if "BEGIN CERTIFICATE" not in ts_pem:
+                    continue
+                tmp_ts_cert = f"/tmp/_dse_tscert_{node.name}.pem"
+                ssh_run(node,
+                    f"printf '%s' {repr(ts_pem)} > {tmp_ts_cert} 2>/dev/null || "
+                    f"cat > {tmp_ts_cert} << 'ENDTS'\n{ts_pem}\nENDTS",
+                    timeout)
+                ts_fp_out, _ = ssh_run(node,
+                    f"openssl x509 -noout -fingerprint -sha256 -in {tmp_ts_cert} 2>/dev/null",
+                    timeout)
+                ssh_run(node, f"rm -f {tmp_ts_cert}", timeout)
+                ts_fp_m = re.search(r"SHA256 Fingerprint=([0-9A-Fa-f:]+)", ts_fp_out)
+                if ts_fp_m:
+                    ts_fp = ts_fp_m.group(1).upper().replace(":", "")
+                    if ts_fp == leaf_fp:
+                        ts_fp_matched = True
+                        break
+
+        if ts_fp_matched:
+            findings.append(Finding(node.name, "issuer_in_truststore", "PASS",
+                                    "Self-signed certificate: matching trusted certificate "
+                                    "found in truststore (SHA-256 fingerprint verified). "
+                                    "Trust is correctly established."))
+        elif leaf_fp:
+            # Fingerprint not found — genuine trust failure
+            findings.append(Finding(
+                node.name, "issuer_in_truststore", "FAIL",
+                "Self-signed certificate is NOT present in the truststore. "
+                "Nodes cannot verify each other's identity — TLS handshakes will fail.",
+                "Import the self-signed certificate into the truststore:\n"
+                "  keytool -import -trustcacerts -noprompt "
+                f"-alias node-cert -keystore {ts} -file <exported-cert.pem>",
+            ))
+        else:
+            findings.append(Finding(node.name, "issuer_in_truststore", "WARN",
+                                    "Self-signed certificate: could not read SHA-256 "
+                                    "fingerprint to verify truststore — check manually.",
+                                    "Run: openssl x509 -noout -fingerprint -sha256 "
+                                    "-in <cert.pem> and compare against truststore entries."))
+    else:
+        # ── CA-signed path: verify the issuer CA DN exists in the truststore ─
+        # Also accept a Subject DN match (some CAs have Subject != commonName).
+        issuer_dn = leaf_issr
+        findings.append(Finding(node.name, "cert_issuer_dn", "INFO",
+                                f"CA-signed certificate. Issuer DN: {issuer_dn}"))
         ts_owners = re.findall(r"Owner:\s*(.+)", ts_list_out)
-        issuer_norm = re.sub(r"\s+", "", issuer_dn).lower()
+        issuer_norm = _norm_dn(issuer_dn)
         matched_in_ts = any(
-            issuer_norm == re.sub(r"\s+", "", o).lower() or
-            issuer_dn.lower() in o.lower()
+            issuer_norm == _norm_dn(o) or _norm_dn(issuer_dn) in _norm_dn(o)
             for o in ts_owners
         )
         if matched_in_ts:
             findings.append(Finding(node.name, "issuer_in_truststore", "PASS",
-                                    "Cert Issuer found in truststore — CA chain verified."))
+                                    "Issuer CA found in truststore — CA chain verified."))
         else:
             findings.append(Finding(
                 node.name, "issuer_in_truststore", "FAIL",
-                f"Cert Issuer '{issuer_dn}' NOT found in truststore. "
-                "Nodes cannot verify each other's certs → TLS handshake will fail.",
-                "Import the signing CA: keytool -import -trustcacerts -alias issuer-ca "
+                f"Issuer CA '{issuer_dn}' NOT found in truststore. "
+                "Nodes cannot verify each other's certs — TLS handshake will fail.",
+                "Import the signing CA:\n"
+                "  keytool -import -trustcacerts -alias issuer-ca "
                 "-file issuer-ca.pem -keystore truststore.jks",
             ))
 
-    # Separate root CAs (self-signed) from intermediates
+    # ── 3d. Build CA bundles for openssl verify ───────────────────────────────
+    # Separate root CAs (self-signed entries in truststore) from intermediates
     root_pems   = []
     inter_pems  = []
     ca_expiries = []
 
     for alias in aliases:
-        pem, rc = ssh_run(node,
+        pem, _ = ssh_run(node,
             f'keytool -exportcert -alias "{alias}" -keystore {ts} '
             f'-storepass "{tspw}" -rfc 2>/dev/null',
             timeout, as_dse=True)
         if "BEGIN CERTIFICATE" not in pem:
             continue
 
-        # Write to temp to inspect with openssl (no dse perms needed for tmp files)
         tmp_ca = f"/tmp/_dse_ca_{node.name}_{alias}.pem"
         ssh_run(node, f"cat > {tmp_ca} << 'ENDPEM'\n{pem}\nENDPEM", timeout)
 
-        # Check self-signed (subject == issuer)
         info_out, _ = ssh_run(node,
             f"openssl x509 -noout -subject -issuer -enddate -in {tmp_ca} 2>/dev/null",
             timeout)
@@ -886,20 +967,22 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         issr_m = re.search(r"issuer=(.+)",  info_out)
         end_m  = re.search(r"notAfter=(.+)", info_out)
 
-        is_root = (subj_m and issr_m and
-                   subj_m.group(1).strip() == issr_m.group(1).strip())
+        # An entry is a root CA if subject==issuer; in a self-signed deployment
+        # the leaf cert is imported as a trustedCertEntry and is treated as root.
+        entry_is_root = (subj_m and issr_m and
+                         _norm_dn(subj_m.group(1)) == _norm_dn(issr_m.group(1)))
 
-        if is_root:
+        if entry_is_root:
             root_pems.append(pem)
             findings.append(Finding(node.name, "truststore_root_ca", "INFO",
-                                    f"Root CA in truststore: {subj_m.group(1).strip()[:80]}"))
+                                    f"Trusted root in truststore: "
+                                    f"{subj_m.group(1).strip()[:80]}"))
         else:
             inter_pems.append(pem)
             findings.append(Finding(node.name, "truststore_intermediate_ca", "INFO",
                                     f"Intermediate CA in truststore: "
                                     f"{subj_m.group(1).strip()[:80] if subj_m else alias}"))
 
-        # CA expiry
         if end_m:
             ca_exp = _parse_date(end_m.group(1).strip())
             if ca_exp:
@@ -915,49 +998,61 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
 
     findings.extend(ca_expiries)
 
-    if not root_pems:
+    # For a self-signed deployment, the leaf cert IS the root — root_pems will
+    # contain it (subject==issuer) so truststore_no_root is only fired when
+    # a CA-signed deployment genuinely has no root in the truststore.
+    if not root_pems and not is_self_signed:
         findings.append(Finding(node.name, "truststore_no_root", "FAIL",
-                                "No self-signed root CA found in truststore.",
+                                "No root CA found in truststore.",
                                 "Import the root CA certificate into the truststore."))
 
-    # ── 3d. openssl verify: leaf against root + intermediates ────────────────
-    # Write root bundle
+    # ── 3e. openssl verify: leaf against trusted bundle ──────────────────────
     tmp_root  = f"/tmp/_dse_root_{node.name}.pem"
     tmp_inter = f"/tmp/_dse_inter_{node.name}.pem"
 
-    root_block = "\n".join(root_pems)
-    ssh_run(node, f"cat > {tmp_root} << 'ENDROOT'\n{root_block}\nENDROOT", timeout)
+    if root_pems:
+        root_block = "\n".join(root_pems)
+        ssh_run(node, f"cat > {tmp_root} << 'ENDROOT'\n{root_block}\nENDROOT", timeout)
 
-    verify_cmd: str
-    if inter_pems:
-        inter_block = "\n".join(inter_pems)
-        ssh_run(node, f"cat > {tmp_inter} << 'ENDINTER'\n{inter_block}\nENDINTER", timeout)
-        # -untrusted feeds the intermediate; -CAfile is the root of trust
-        verify_cmd = (f"openssl verify -CAfile {tmp_root} "
-                      f"-untrusted {tmp_inter} {tmp_leaf} 2>&1")
+        verify_cmd: str
+        if inter_pems:
+            inter_block = "\n".join(inter_pems)
+            ssh_run(node,
+                f"cat > {tmp_inter} << 'ENDINTER'\n{inter_block}\nENDINTER", timeout)
+            verify_cmd = (f"openssl verify -CAfile {tmp_root} "
+                          f"-untrusted {tmp_inter} {tmp_leaf} 2>&1")
+        else:
+            verify_cmd = f"openssl verify -CAfile {tmp_root} {tmp_leaf} 2>&1"
+
+        verify_out, verify_rc = ssh_run(node, verify_cmd, timeout)
+
+        if "OK" in verify_out and verify_rc == 0:
+            findings.append(Finding(node.name, "chain_verify", "PASS",
+                                    "openssl verify: certificate chain OK "
+                                    f"({'self-signed' if is_self_signed else 'CA-signed'}"
+                                    f"{', intermediate included' if inter_pems else ''})."))
+        else:
+            err = verify_out.strip()
+            if is_self_signed and ("self signed" in err or "self-signed" in err):
+                # openssl verify sometimes emits "self signed certificate" as an error
+                # but this is informational for a correctly configured self-signed cluster.
+                findings.append(Finding(node.name, "chain_verify", "INFO",
+                                        "openssl verify: self-signed certificate — "
+                                        "chain verification not applicable. "
+                                        "Trust is verified via fingerprint match above."))
+            else:
+                fix = "Import the correct root/intermediate CA into the truststore."
+                if "unable to get local issuer" in err:
+                    fix = ("Intermediate CA issuer not found. "
+                           "Import the intermediate CA into the truststore or keystore chain.")
+                elif "certificate has expired" in err:
+                    fix = "A CA in the chain has expired. Renew and re-import it."
+                findings.append(Finding(node.name, "chain_verify", "FAIL",
+                                        f"openssl verify FAILED: {err[:200]}", fix))
     else:
-        verify_cmd = f"openssl verify -CAfile {tmp_root} {tmp_leaf} 2>&1"
-
-    verify_out, verify_rc = ssh_run(node, verify_cmd, timeout)
-
-    if "OK" in verify_out and verify_rc == 0:
-        findings.append(Finding(node.name, "chain_verify", "PASS",
-                                "openssl verify: certificate chain OK "
-                                f"(root{'+ intermediate' if inter_pems else ''})."))
-    else:
-        # Map common openssl error messages to actionable remediations
-        err = verify_out.strip()
-        fix = "Import the correct root/intermediate CA into the truststore."
-        if "unable to get local issuer" in err:
-            fix = ("Intermediate CA issuer not found. "
-                   "Import the intermediate CA into the truststore or keystore chain.")
-        elif "self signed" in err:
-            fix = ("Self-signed cert presented where a CA-signed cert is expected. "
-                   "Replace with a properly CA-signed certificate.")
-        elif "certificate has expired" in err:
-            fix = "A CA in the chain has expired. Renew and re-import the CA certificate."
-        findings.append(Finding(node.name, "chain_verify", "FAIL",
-                                f"openssl verify FAILED: {err[:200]}", fix))
+        # No root bundle available — skip openssl verify
+        findings.append(Finding(node.name, "chain_verify", "SKIP",
+                                "openssl verify skipped — no root CA bundle available."))
 
     # Cleanup
     ssh_run(node, f"rm -f {tmp_leaf} {tmp_root} {tmp_inter}", timeout)
