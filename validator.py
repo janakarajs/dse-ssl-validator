@@ -1458,33 +1458,82 @@ def check_native_ssl(node: Node, timeout: int) -> List[Finding]:
 # Stage 10 — OpsCenter / Agent SSL
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── OpsCenter SSL helpers ─────────────────────────────────────────────────────
+
+def _ops_file_check(ops: "Node", path: str, label: str, timeout: int,
+                    must_exist: bool = True) -> "Finding":
+    """
+    Stat a file on the OpsCenter host as the opscenter user.
+    Returns a single Finding: PASS if present+readable, FAIL/WARN if not.
+    """
+    stat_out, rc = ssh_run(ops,
+        f"stat -c '%U %G %a %s' {path} 2>/dev/null || echo MISSING",
+        timeout, as_dse=True)
+    if "MISSING" in stat_out or rc != 0:
+        sev = "FAIL" if must_exist else "WARN"
+        return Finding("opscenter", f"ops_file_{label}", sev,
+                       f"{label}: file not found at {path}.",
+                       f"Expected: sudo ls -la {path}")
+    parts = stat_out.strip().split()
+    owner, group, mode, size = (parts + ["?", "?", "?", "0"])[:4]
+    # Warn if world-readable (mode ends in non-zero other bits)
+    try:
+        world_read = bool(int(mode, 8) & 0o004)
+    except ValueError:
+        world_read = False
+    if world_read:
+        return Finding("opscenter", f"ops_file_{label}", "WARN",
+                       f"{label}: {path} is world-readable (mode={mode}).",
+                       f"Fix: chmod 640 {path}")
+    return Finding("opscenter", f"ops_file_{label}", "PASS",
+                   f"{label}: {path}  owner={owner}:{group}  mode={mode}  size={size}B")
+
+
+def _parse_ini_section(text: str, section: str) -> dict:
+    """
+    Extract key=value pairs from a named [section] in an INI-style config.
+    Returns a dict of {key: value} found in that section.
+    """
+    result: dict = {}
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = (stripped.lower() == f"[{section.lower()}]")
+            continue
+        if in_section and "=" in stripped and not stripped.startswith("#"):
+            k, _, v = stripped.partition("=")
+            result[k.strip().lower()] = v.strip()
+    return result
+
+
 def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Finding]:
     """
-    Validate OpsCenter ↔ DSE agent SSL configuration.
+    Comprehensive OpsCenter ↔ DSE agent SSL validation.
 
-    opscenterd.conf is owned by the opscenter OS user (not the SSH user).
-    ops_cfg must carry dse_user + use_sudo so the conf file is read via
-    'sudo -u opscenter' — exactly as for cassandra.yaml on DSE nodes.
+    Covers three layers:
+      A. OpsCenter host — opscenterd.conf, SSL files, cluster conf
+      B. DSE agent nodes — address.yaml, agentKeyStore, port 61621 TLS
+      C. Connectivity — OpsCenter Stomp ports reachable from DSE nodes
 
     inventory.yml opscenter block:
       opscenter:
-        host:      10.1.1.10
-        ssh_user:  automaton       # SSH login account
-        ssh_key:   ~/.ssh/id_rsa
-        dse_user:  opscenter       # OS user that owns opscenterd.conf
-        use_sudo:  true            # sudo -u opscenter (NOPASSWD required)
-        conf:      /etc/opscenter/opscenterd.conf
+        host:         10.1.1.10
+        ssh_user:     automaton          # SSH login account
+        ssh_key:      ~/.ssh/id_rsa
+        dse_user:     opscenter          # OS user that owns opscenterd.conf
+        use_sudo:     true               # sudo -u opscenter (NOPASSWD required)
+        conf:         /etc/opscenter/opscenterd.conf
+        ssl_dir:      /var/lib/opscenter/ssl   # where opscenter.key etc live
+        cluster_conf: /etc/opscenter/clusters  # directory of cluster .conf files
     """
-    findings  = []
-    conf_path = ops_cfg.get("conf", "/etc/opscenter/opscenterd.conf")
-
-    # Build a Node that mirrors how DSE nodes are handled:
-    #   ssh_user  = inventory ssh_user (e.g. automaton)
-    #   dse_user  = opscenter OS user that owns the conf (e.g. opscenter)
-    #   use_sudo  = True → reads conf via sudo -u opscenter
-    ssh_user = ops_cfg.get("ssh_user", "ubuntu")
-    dse_user = ops_cfg.get("dse_user", "opscenter")
-    use_sudo = bool(ops_cfg.get("use_sudo", True))
+    findings: List[Finding] = []
+    conf_path   = ops_cfg.get("conf",         "/etc/opscenter/opscenterd.conf")
+    ssl_dir     = ops_cfg.get("ssl_dir",      "/var/lib/opscenter/ssl")
+    cluster_dir = ops_cfg.get("cluster_conf", "/etc/opscenter/clusters")
+    ssh_user    = ops_cfg.get("ssh_user",     "ubuntu")
+    dse_user    = ops_cfg.get("dse_user",     "opscenter")
+    use_sudo    = bool(ops_cfg.get("use_sudo", True))
 
     ops = Node(
         name     = "opscenter",
@@ -1497,98 +1546,284 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
     if not ops.host:
         return []
 
-    # Read the [agents] block as the opscenter OS user
-    out, rc = ssh_run(ops,
-        f'grep -A30 "\\[agents\\]" {conf_path} 2>/dev/null',
-        timeout, as_dse=True)
+    # ── A. Read opscenterd.conf ───────────────────────────────────────────────
+    # Read as opscenter OS user; fall back to direct if same user
+    full_conf, rc = ssh_run(ops,
+        f"cat {conf_path} 2>/dev/null", timeout, as_dse=True)
+    if rc != 0 or not full_conf.strip():
+        full_conf, rc = ssh_run(ops,
+            f"cat {conf_path} 2>/dev/null", timeout, as_dse=False)
 
-    if rc != 0 or not out.strip():
-        # Try without privilege escalation in case the SSH user can read it directly
-        out, rc = ssh_run(ops,
-            f'grep -A30 "\\[agents\\]" {conf_path} 2>/dev/null',
-            timeout, as_dse=False)
-
-    if rc != 0 or not out.strip():
+    if rc != 0 or not full_conf.strip():
         return [Finding("opscenter", "opscenterd_conf", "SKIP",
                         f"opscenterd.conf not readable at {conf_path} "
-                        f"(tried as '{ssh_user}' and '{dse_user}'). "
-                        "Set dse_user: opscenter and use_sudo: true in inventory opscenter block.",
+                        f"(tried as '{ssh_user}' and '{dse_user}').",
                         f"Add to inventory.yml opscenter block:\n"
                         f"  dse_user: opscenter\n"
                         f"  use_sudo: true\n"
                         f"And grant sudo on the OpsCenter host:\n"
-                        f"  {ssh_user} ALL=(opscenter) NOPASSWD: /bin/grep, /bin/cat")]
+                        f"  {ssh_user} ALL=(opscenter) NOPASSWD: /bin/cat, /bin/grep, "
+                        f"/usr/bin/stat, /bin/ls")]
 
-    # ── SSL enabled/disabled ──────────────────────────────────────────────────
-    use_ssl = bool(re.search(r"use_ssl\s*=\s*true", out, re.I))
-    ssl_absent = not re.search(r"use_ssl", out, re.I)
+    findings.append(Finding("opscenter", "opscenterd_conf", "PASS",
+                            f"opscenterd.conf readable at {conf_path}."))
+
+    agents  = _parse_ini_section(full_conf, "agents")
+    webserv = _parse_ini_section(full_conf, "webserver")
+
+    # ── A1. use_ssl ───────────────────────────────────────────────────────────
+    use_ssl    = agents.get("use_ssl", "").lower() == "true"
+    ssl_absent = "use_ssl" not in agents
 
     if use_ssl:
-        findings.append(Finding("opscenter", "opscenter_use_ssl", "PASS",
-                                "[agents] use_ssl = true — SSL is enabled."))
+        findings.append(Finding("opscenter", "ops_use_ssl", "PASS",
+                                "[agents] use_ssl = true — Stomp SSL enabled."))
     elif ssl_absent:
-        findings.append(Finding("opscenter", "opscenter_use_ssl", "INFO",
-                                "[agents] use_ssl not set — SSL is disabled (default). "
-                                "Agent communication is unencrypted.",
-                                "Set  use_ssl = true  in opscenterd.conf [agents] "
-                                "to encrypt OpsCenter ↔ agent traffic."))
+        findings.append(Finding("opscenter", "ops_use_ssl", "INFO",
+                                "[agents] use_ssl not set — agent communication is unencrypted.",
+                                "Set  use_ssl = true  in opscenterd.conf [agents]."))
     else:
-        findings.append(Finding("opscenter", "opscenter_use_ssl", "WARN",
-                                "[agents] use_ssl = false — SSL is explicitly disabled. "
-                                "Agent communication is unencrypted.",
-                                "Set  use_ssl = true  in opscenterd.conf [agents] "
-                                "to encrypt OpsCenter ↔ agent traffic."))
+        findings.append(Finding("opscenter", "ops_use_ssl", "WARN",
+                                "[agents] use_ssl = false — agent communication is explicitly unencrypted.",
+                                "Set  use_ssl = true  in opscenterd.conf [agents]."))
 
-    # ── ssl_keyfile: only validate when SSL is actually enabled ───────────────
-    # When use_ssl = false, the keyfile is not loaded and its absence is not a problem.
+    # ── A2. OpsCenter SSL files (only when SSL is enabled) ────────────────────
+    # Required files in ssl_dir:
+    #   opscenter.key  — PEM private key for Stomp SSL server
+    #   opscenter.pem  — PEM certificate for Stomp SSL server
+    #   opscenter.der  — DER certificate (alternative cert format, also used)
+    #   agentKeyStore  — Java keystore distributed to agents for port 61621 HTTPS
+    #   agentKeyStore.key — PEM key for agent HTTPS server
+    #   agentKeyStore.der — DER cert for agent HTTPS server
     if use_ssl:
-        m = re.search(r"ssl_keyfile\s*=\s*(\S+)", out)
-        if m:
-            kf = m.group(1)
-            if kf.lower().endswith((".jks", ".p12", ".pfx")):
-                findings.append(Finding("opscenter", "opscenter_wrong_keyfile", "FAIL",
-                                        f"ssl_keyfile={kf} is a Java keystore — must be a PEM private key.",
-                                        "OpsCenter uses PEM format, not JKS/PKCS12. "
-                                        "Set ssl_keyfile = /etc/opscenter/ssl/opscenter.key "
-                                        "(the OpsCenter PEM private key, not a DSE node keystore)."))
-            else:
-                findings.append(Finding("opscenter", "opscenter_keyfile", "PASS",
-                                        f"ssl_keyfile={kf} (PEM format)."))
-        else:
-            findings.append(Finding("opscenter", "opscenter_keyfile_missing", "FAIL",
-                                    "ssl_keyfile not configured in [agents] but use_ssl = true.",
-                                    "Set ssl_keyfile = /etc/opscenter/ssl/opscenter.key"))
-    else:
-        # SSL off — report ssl_keyfile presence as INFO only
-        m = re.search(r"ssl_keyfile\s*=\s*(\S+)", out)
-        if m:
-            findings.append(Finding("opscenter", "opscenter_keyfile", "INFO",
-                                    f"ssl_keyfile={m.group(1)} is configured but "
-                                    "use_ssl = false so it is not active."))
-        else:
-            findings.append(Finding("opscenter", "opscenter_keyfile", "INFO",
-                                    "ssl_keyfile not set (not required when use_ssl = false)."))
+        for fname, label, critical in [
+            ("opscenter.key", "ops_ssl_key",        True),
+            ("opscenter.pem", "ops_ssl_cert_pem",   True),
+            ("opscenter.der", "ops_ssl_cert_der",   False),
+            ("agentKeyStore", "agent_keystore",     True),
+            ("agentKeyStore.key", "agent_key",      True),
+            ("agentKeyStore.der", "agent_cert_der", False),
+        ]:
+            findings.append(_ops_file_check(
+                ops, f"{ssl_dir}/{fname}", label, timeout, must_exist=critical))
 
-    # ── Agent port reachability (always checked regardless of SSL state) ──────
-    # Port 61620 = agent HTTP (used even without SSL for metrics/commands)
-    # Port 61621 = agent STOMP over SSL (only meaningful when use_ssl = true)
+    # ── A3. Validate [agents] SSL file references point to real files ─────────
+    if use_ssl:
+        for key, label in [
+            ("ssl_keyfile",      "ssl_keyfile"),
+            ("ssl_certfile",     "ssl_certfile"),
+            ("agent_keyfile",    "agent_keyfile"),
+            ("agent_keyfile_raw","agent_keyfile_raw"),
+            ("agent_certfile",   "agent_certfile"),
+        ]:
+            val = agents.get(key, "")
+            if not val:
+                findings.append(Finding("opscenter", f"ops_conf_{label}", "FAIL",
+                                        f"[agents] {key} not set in opscenterd.conf.",
+                                        f"Set {key} = {ssl_dir}/{label.replace('_', '', 1)}.der"))
+            else:
+                findings.append(Finding("opscenter", f"ops_conf_{label}", "INFO",
+                                        f"[agents] {key} = {val}"))
+                # Check that ssl_keyfile is PEM (not JKS) — common misconfiguration
+                if key == "ssl_keyfile" and val.lower().endswith((".jks", ".p12", ".pfx")):
+                    findings.append(Finding("opscenter", "ops_ssl_keyfile_format", "FAIL",
+                                            f"ssl_keyfile={val} is a Java keystore. "
+                                            "OpsCenter requires a PEM private key here.",
+                                            f"Set ssl_keyfile = {ssl_dir}/opscenter.key"))
+
+    # ── A4. Cluster conf files — agent + cassandra keystores ─────────────────
+    # /etc/opscenter/clusters/<name>.conf holds [agents] and [cassandra] sections
+    # with keystore/truststore paths for DSE nodes and OpsCenter CQL connections.
+    cluster_confs_out, _ = ssh_run(ops,
+        f"ls {cluster_dir}/*.conf 2>/dev/null", timeout, as_dse=True)
+    cluster_files = [f.strip() for f in cluster_confs_out.splitlines()
+                     if f.strip().endswith(".conf")]
+
+    for cf in cluster_files:
+        cf_content, cf_rc = ssh_run(ops, f"cat {cf} 2>/dev/null",
+                                    timeout, as_dse=True)
+        if cf_rc != 0 or not cf_content.strip():
+            findings.append(Finding("opscenter", "cluster_conf", "WARN",
+                                    f"Cluster conf not readable: {cf}"))
+            continue
+
+        cf_name = cf.split("/")[-1]
+        cc_agents = _parse_ini_section(cf_content, "agents")
+        cc_cass   = _parse_ini_section(cf_content, "cassandra")
+
+        # [agents] block — paths on DSE nodes read by datastax-agent (cassandra user)
+        for key, label in [("ssl_keystore",  "agent_ssl_keystore"),
+                            ("ssl_truststore","agent_ssl_truststore")]:
+            val = cc_agents.get(key, "")
+            if use_ssl and not val:
+                findings.append(Finding("opscenter", f"cluster_conf_{label}", "WARN",
+                                        f"{cf_name} [agents] {key} not set. "
+                                        "Agents need the DSE keystore/truststore paths.",
+                                        f"Set {key} = /etc/dse/cassandra/ssl/dse-keystore.jks"))
+            elif val:
+                findings.append(Finding("opscenter", f"cluster_conf_{label}", "INFO",
+                                        f"{cf_name} [agents] {key} = {val}"))
+
+        # [cassandra] block — paths on OpsCenter host read by opscenter process
+        for key, label in [("ssl_keystore",  "cql_keystore"),
+                            ("ssl_truststore","cql_truststore")]:
+            val = cc_cass.get(key, "")
+            if use_ssl and not val:
+                findings.append(Finding("opscenter", f"cluster_conf_{label}", "WARN",
+                                        f"{cf_name} [cassandra] {key} not set. "
+                                        "OpsCenter needs a keystore/truststore to connect to DSE via CQL SSL.",
+                                        f"Set {key} = {ssl_dir}/client-keystore.jks"))
+            elif val:
+                # Verify the file actually exists on the OpsCenter host
+                findings.append(_ops_file_check(
+                    ops, val, f"cql_{key}", timeout, must_exist=True))
+
+    # ── B. DSE agent nodes — address.yaml + agentKeyStore + port 61621 ────────
+    agent_yaml = "/var/lib/datastax-agent/conf/address.yaml"
+    agent_ks   = "/var/lib/datastax-agent/ssl/agentKeyStore"
+
     for n in nodes:
-        for port, label in ((61620, "agent_http"), (61621, "agent_stomp_ssl")):
-            out2, _ = ssh_run(n,
+        # B1. address.yaml
+        ay_out, ay_rc = ssh_run(n,
+            f"cat {agent_yaml} 2>/dev/null", timeout, as_dse=True)
+        if ay_rc != 0 or not ay_out.strip():
+            findings.append(Finding(n.name, "agent_address_yaml", "WARN",
+                                    f"address.yaml not readable at {agent_yaml}.",
+                                    "Ensure datastax-agent is installed and address.yaml is configured."))
+        else:
+            findings.append(Finding(n.name, "agent_address_yaml", "PASS",
+                                    f"address.yaml found at {agent_yaml}."))
+
+            # B2. use_ssl in address.yaml
+            ay_use_ssl = re.search(r"use_ssl\s*:\s*1", ay_out)
+            if use_ssl and not ay_use_ssl:
+                findings.append(Finding(n.name, "agent_use_ssl", "FAIL",
+                                        "address.yaml use_ssl: 1 not set but OpsCenter has use_ssl=true.",
+                                        "Add  use_ssl: 1  to address.yaml and restart datastax-agent."))
+            elif ay_use_ssl:
+                findings.append(Finding(n.name, "agent_use_ssl", "PASS",
+                                        "address.yaml use_ssl: 1 — agent Stomp SSL enabled."))
+            else:
+                findings.append(Finding(n.name, "agent_use_ssl", "INFO",
+                                        "address.yaml use_ssl not set — agent using plaintext Stomp."))
+
+            # B3. stomp_interface points to OpsCenter host
+            stomp_m = re.search(r"stomp_interface\s*:\s*(\S+)", ay_out)
+            stomp_ip = stomp_m.group(1).strip() if stomp_m else ""
+            if stomp_ip and stomp_ip != ops.host:
+                findings.append(Finding(n.name, "agent_stomp_interface", "WARN",
+                                        f"stomp_interface={stomp_ip} does not match "
+                                        f"OpsCenter host {ops.host}.",
+                                        f"Set  stomp_interface: {ops.host}  in address.yaml."))
+            elif stomp_ip:
+                findings.append(Finding(n.name, "agent_stomp_interface", "PASS",
+                                        f"stomp_interface={stomp_ip} matches OpsCenter host."))
+
+            # B4. opscenter_ssl_keystore configured (for port 61621 HTTPS server)
+            if use_ssl:
+                oks_m = re.search(r"opscenter_ssl_keystore\s*:\s*(\S+)", ay_out)
+                if oks_m:
+                    findings.append(Finding(n.name, "agent_ks_path", "PASS",
+                                            f"opscenter_ssl_keystore = {oks_m.group(1)}"))
+                    # Check fixed password: always 'opscenter' per OpsCenter setup.py
+                    pwd_m = re.search(r"opscenter_ssl_keystore_password\s*:\s*(\S+)", ay_out)
+                    if pwd_m:
+                        findings.append(Finding(n.name, "agent_ks_password", "INFO",
+                                                "opscenter_ssl_keystore_password is set."))
+                    else:
+                        findings.append(Finding(n.name, "agent_ks_password", "WARN",
+                                                "opscenter_ssl_keystore_password not set in address.yaml.",
+                                                "Add  opscenter_ssl_keystore_password: opscenter  "
+                                                "(fixed password set by OpsCenter setup.py)."))
+                else:
+                    findings.append(Finding(n.name, "agent_ks_path", "FAIL",
+                                            "opscenter_ssl_keystore not set in address.yaml "
+                                            "but OpsCenter use_ssl=true.",
+                                            f"Add  opscenter_ssl_keystore: {agent_ks}  "
+                                            "to address.yaml."))
+
+            # B5. DSE keystore/truststore paths in address.yaml
+            for key, desc in [("ssl_keystore",  "DSE keystore for agent Stomp"),
+                               ("ssl_truststore","DSE truststore for agent Stomp")]:
+                ks_m = re.search(rf"{key}\s*:\s*(\S+)", ay_out)
+                if use_ssl and not ks_m:
+                    findings.append(Finding(n.name, f"agent_{key}", "WARN",
+                                            f"address.yaml {key} not set ({desc}).",
+                                            f"Set  {key}: /etc/dse/cassandra/ssl/dse-keystore.jks  "
+                                            "in address.yaml."))
+                elif ks_m:
+                    findings.append(Finding(n.name, f"agent_{key}", "INFO",
+                                            f"address.yaml {key} = {ks_m.group(1)}"))
+
+        # B6. agentKeyStore file present on DSE node
+        if use_ssl:
+            aks_stat, _ = ssh_run(n,
+                f"stat -c '%U %G %a' {agent_ks} 2>/dev/null || echo MISSING",
+                timeout, as_dse=True)
+            if "MISSING" in aks_stat:
+                findings.append(Finding(n.name, "agent_keystore_file", "FAIL",
+                                        f"agentKeyStore not found at {agent_ks}.",
+                                        "Copy agentKeyStore from OpsCenter host:\n"
+                                        f"  scp opscenter:{ssl_dir}/agentKeyStore "
+                                        f"/tmp/ && sudo mv /tmp/agentKeyStore {agent_ks}\n"
+                                        "  sudo chown cassandra:cassandra "
+                                        f"{agent_ks} && sudo chmod 640 {agent_ks}"))
+            else:
+                parts = aks_stat.strip().split()
+                owner, group, mode = (parts + ["?", "?", "?"])[:3]
+                findings.append(Finding(n.name, "agent_keystore_file", "PASS",
+                                        f"agentKeyStore present: {agent_ks}  "
+                                        f"owner={owner}:{group}  mode={mode}"))
+
+        # B7. Port 61621 — agent HTTPS API — live TLS handshake from this node
+        if use_ssl:
+            tls_out, _ = ssh_run(n,
+                f"echo | timeout {timeout} openssl s_client "
+                f"-connect {n.host}:61621 2>&1 | head -8",
+                timeout)
+            connected = "CONNECTED" in tls_out
+            findings.append(Finding(n.name, "agent_https_tls",
+                                    "PASS" if connected else "WARN",
+                                    f"Port 61621 (agent HTTPS API): "
+                                    f"{'TLS handshake OK' if connected else 'no TLS response'}.",
+                                    "" if connected else
+                                    "Verify opscenter_ssl_keystore is set in address.yaml "
+                                    "and datastax-agent has been restarted."))
+
+    # ── C. Connectivity — DSE nodes → OpsCenter Stomp ports ──────────────────
+    # Port 61619 — internal Stomp (closed from outside, INFO only)
+    # Port 61620 — agent Stomp SSL (DSE nodes must reach this)
+    # Port 61621 — agent HTTPS API (OpsCenter pushes config, reads metrics here)
+    for n in nodes:
+        for port, label, needed_when_ssl in [
+            (61619, "ops_stomp_internal", False),
+            (61620, "ops_stomp_ssl",      True),
+            (61621, "ops_https_api",      True),
+        ]:
+            nc_out, _ = ssh_run(n,
                 f"nc -zv -w5 {ops.host} {port} 2>&1 || echo CLOSED", timeout)
-            up = "CLOSED" not in out2 and "refused" not in out2.lower()
-            if label == "agent_stomp_ssl" and not use_ssl:
-                # STOMP SSL port is only expected to be up when SSL is enabled
+            up = "CLOSED" not in nc_out and "refused" not in nc_out.lower()
+
+            if port == 61619:
+                # 61619 is internal — closed from outside is normal
+                findings.append(Finding(n.name, label,
+                                        "INFO",
+                                        f"Port {port} (internal Stomp): "
+                                        f"{'reachable (unusual — should be loopback only)' if up else 'closed from DSE node (expected)'}."))
+            elif not use_ssl and needed_when_ssl:
                 findings.append(Finding(n.name, label,
                                         "INFO" if not up else "PASS",
-                                        f"OpsCenter port {port} ({label}): "
+                                        f"Port {port} ({label}): "
                                         f"{'reachable' if up else 'not listening'} "
-                                        f"(SSL is disabled — port not expected to be active)."))
+                                        f"(SSL disabled — port may not be active)."))
             else:
                 findings.append(Finding(n.name, label,
                                         "PASS" if up else "WARN",
-                                        f"OpsCenter port {port} ({label}): "
-                                        f"{'reachable' if up else 'unreachable'}."))
+                                        f"Port {port} ({label}): "
+                                        f"{'reachable from {}'.format(n.name) if up else 'unreachable from {}'.format(n.name)}.",
+                                        "" if up else
+                                        f"Check firewall/security-group allows {n.host} → {ops.host}:{port}"))
+
     return findings
 
 

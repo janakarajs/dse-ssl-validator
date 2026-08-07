@@ -322,12 +322,14 @@ When `ssh_user == dse_user` or `dse_user` is empty, no sudo wrapping is applied.
 
 ```yaml
 opscenter:
-  host:      10.1.1.10
-  ssh_user:  automaton          # SSH login account (same as DSE nodes)
-  ssh_key:   ~/.ssh/id_rsa
-  dse_user:  opscenter          # OS user that owns opscenterd.conf
-  use_sudo:  true               # sudo -u opscenter (NOPASSWD required)
-  conf:      /etc/opscenter/opscenterd.conf
+  host:         10.1.1.10
+  ssh_user:     automaton                       # SSH login account
+  ssh_key:      ~/.ssh/id_rsa
+  dse_user:     opscenter                       # OS user that owns opscenterd.conf
+  use_sudo:     true                            # sudo -u opscenter (NOPASSWD required)
+  conf:         /etc/opscenter/opscenterd.conf
+  ssl_dir:      /var/lib/opscenter/ssl          # where opscenter.key etc live
+  cluster_conf: /etc/opscenter/clusters         # directory of cluster .conf files
 ```
 
 > **Important:** `opscenterd.conf` is owned by the `opscenter` OS user, not the SSH login user.
@@ -336,25 +338,63 @@ opscenter:
 Required sudoers entry on the OpsCenter host:
 
 ```
-automaton ALL=(opscenter) NOPASSWD: /bin/grep, /bin/cat
+automaton ALL=(opscenter) NOPASSWD: /bin/cat, /bin/grep, /usr/bin/stat, /bin/ls
 ```
 
 ### Via CLI
 
 ```bash
-python3 validator.py -i inventory.yml --opscenter-host 10.1.1.10
-python3 validator.py --local --opscenter-host 10.1.1.10
+python3 validator.py -i inventory.yml --check-mode opscenter
 python3 validator.py -i inventory.yml -m opscenter
 ```
 
-### Checks performed
+> Run from any host that has SSH access to both the OpsCenter host and DSE nodes.
+> You do **not** need to run this from the OpsCenter node itself.
 
-| Check | What is validated |
-|-------|-------------------|
-| `opscenter_use_ssl` | `[agents] use_ssl` in `opscenterd.conf`. PASS when `true`, INFO when absent (SSL off by default), WARN when explicitly `false` |
-| `opscenter_keyfile` | `ssl_keyfile` is a PEM private key, not a `.jks`/`.p12`. Only validated when `use_ssl = true` |
-| `agent_http` | Port 61620 reachable from each DSE node |
-| `agent_stomp_ssl` | Port 61621 (STOMP over SSL) reachable from each DSE node |
+### What is validated
+
+The opscenter module checks three layers:
+
+**A. OpsCenter host (`opscenterd.conf` + SSL files)**
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `opscenterd_conf` | PASS / SKIP | Config file readable; SKIP with remediation if not |
+| `ops_use_ssl` | PASS / WARN / INFO | `[agents] use_ssl` — PASS=true, WARN=false, INFO=absent |
+| `ops_file_ops_ssl_key` | PASS / FAIL | `opscenter.key` present in `ssl_dir` |
+| `ops_file_ops_ssl_cert_pem` | PASS / FAIL | `opscenter.pem` present in `ssl_dir` |
+| `ops_file_agent_keystore` | PASS / FAIL | `agentKeyStore` present in `ssl_dir` (distributed to agents) |
+| `ops_file_agent_key` | PASS / FAIL | `agentKeyStore.key` present in `ssl_dir` |
+| `ops_conf_ssl_keyfile` | INFO / FAIL | `[agents] ssl_keyfile` set; FAIL if JKS format |
+| `ops_conf_ssl_certfile` | INFO / FAIL | `[agents] ssl_certfile` set |
+| `ops_conf_agent_keyfile` | INFO / FAIL | `[agents] agent_keyfile` set |
+| `ops_conf_agent_keyfile_raw` | INFO / FAIL | `[agents] agent_keyfile_raw` set |
+| `ops_conf_agent_certfile` | INFO / FAIL | `[agents] agent_certfile` set |
+| `cluster_conf_cql_keystore` | PASS / WARN | `clusters/<name>.conf [cassandra] ssl_keystore` exists on OpsCenter host |
+| `cluster_conf_cql_truststore` | PASS / WARN | `clusters/<name>.conf [cassandra] ssl_truststore` exists on OpsCenter host |
+| `cluster_conf_agent_ssl_keystore` | INFO / WARN | `clusters/<name>.conf [agents] ssl_keystore` path on DSE nodes |
+
+**B. Each DSE node (`address.yaml` + `agentKeyStore`)**
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `agent_address_yaml` | PASS / WARN | `/var/lib/datastax-agent/conf/address.yaml` readable |
+| `agent_use_ssl` | PASS / FAIL / INFO | `use_ssl: 1` matches OpsCenter `use_ssl = true` |
+| `agent_stomp_interface` | PASS / WARN | `stomp_interface` matches OpsCenter host IP |
+| `agent_ks_path` | PASS / FAIL | `opscenter_ssl_keystore` set (required for port 61621 HTTPS) |
+| `agent_ks_password` | INFO / WARN | `opscenter_ssl_keystore_password` set (fixed value: `opscenter`) |
+| `agent_ssl_keystore` | INFO / WARN | `ssl_keystore` set in address.yaml (DSE keystore for Stomp) |
+| `agent_ssl_truststore` | INFO / WARN | `ssl_truststore` set in address.yaml |
+| `agent_keystore_file` | PASS / FAIL | `/var/lib/datastax-agent/ssl/agentKeyStore` present |
+| `agent_https_tls` | PASS / WARN | TLS handshake on port 61621 (agent HTTPS API) |
+
+**C. Port connectivity (DSE node → OpsCenter)**
+
+| Check | Port | Severity | What it catches |
+|-------|------|----------|----------------|
+| `ops_stomp_internal` | 61619 | INFO | Internal only — closed from DSE nodes is expected |
+| `ops_stomp_ssl` | 61620 | PASS / WARN | Agent Stomp SSL — must be reachable from all DSE nodes |
+| `ops_https_api` | 61621 | PASS / WARN | Agent HTTPS API — must be reachable from all DSE nodes |
 
 ---
 
