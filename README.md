@@ -322,10 +322,21 @@ When `ssh_user == dse_user` or `dse_user` is empty, no sudo wrapping is applied.
 
 ```yaml
 opscenter:
-  host:     10.1.1.10
-  ssh_user: ubuntu
-  ssh_key:  ~/.ssh/id_rsa
-  conf:     /etc/opscenter/opscenterd.conf
+  host:      10.1.1.10
+  ssh_user:  automaton          # SSH login account (same as DSE nodes)
+  ssh_key:   ~/.ssh/id_rsa
+  dse_user:  opscenter          # OS user that owns opscenterd.conf
+  use_sudo:  true               # sudo -u opscenter (NOPASSWD required)
+  conf:      /etc/opscenter/opscenterd.conf
+```
+
+> **Important:** `opscenterd.conf` is owned by the `opscenter` OS user, not the SSH login user.
+> Without `dse_user` + `use_sudo`, the validator cannot read the file and all checks are skipped.
+
+Required sudoers entry on the OpsCenter host:
+
+```
+automaton ALL=(opscenter) NOPASSWD: /bin/grep, /bin/cat
 ```
 
 ### Via CLI
@@ -340,8 +351,8 @@ python3 validator.py -i inventory.yml -m opscenter
 
 | Check | What is validated |
 |-------|-------------------|
-| `opscenter_use_ssl` | `[agents] use_ssl = true` in `opscenterd.conf` |
-| `opscenter_keyfile` | `ssl_keyfile` is a PEM private key, not a `.jks` or `.p12` file |
+| `opscenter_use_ssl` | `[agents] use_ssl` in `opscenterd.conf`. PASS when `true`, INFO when absent (SSL off by default), WARN when explicitly `false` |
+| `opscenter_keyfile` | `ssl_keyfile` is a PEM private key, not a `.jks`/`.p12`. Only validated when `use_ssl = true` |
 | `agent_http` | Port 61620 reachable from each DSE node |
 | `agent_stomp_ssl` | Port 61621 (STOMP over SSL) reachable from each DSE node |
 

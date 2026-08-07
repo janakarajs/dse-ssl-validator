@@ -1459,50 +1459,136 @@ def check_native_ssl(node: Node, timeout: int) -> List[Finding]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Finding]:
+    """
+    Validate OpsCenter ↔ DSE agent SSL configuration.
+
+    opscenterd.conf is owned by the opscenter OS user (not the SSH user).
+    ops_cfg must carry dse_user + use_sudo so the conf file is read via
+    'sudo -u opscenter' — exactly as for cassandra.yaml on DSE nodes.
+
+    inventory.yml opscenter block:
+      opscenter:
+        host:      10.1.1.10
+        ssh_user:  automaton       # SSH login account
+        ssh_key:   ~/.ssh/id_rsa
+        dse_user:  opscenter       # OS user that owns opscenterd.conf
+        use_sudo:  true            # sudo -u opscenter (NOPASSWD required)
+        conf:      /etc/opscenter/opscenterd.conf
+    """
     findings  = []
     conf_path = ops_cfg.get("conf", "/etc/opscenter/opscenterd.conf")
-    ops       = Node(name="opscenter", host=ops_cfg.get("host", ""),
-                     ssh_user=ops_cfg.get("ssh_user", "ubuntu"),
-                     ssh_key =ops_cfg.get("ssh_key",  ""))
+
+    # Build a Node that mirrors how DSE nodes are handled:
+    #   ssh_user  = inventory ssh_user (e.g. automaton)
+    #   dse_user  = opscenter OS user that owns the conf (e.g. opscenter)
+    #   use_sudo  = True → reads conf via sudo -u opscenter
+    ssh_user = ops_cfg.get("ssh_user", "ubuntu")
+    dse_user = ops_cfg.get("dse_user", "opscenter")
+    use_sudo = bool(ops_cfg.get("use_sudo", True))
+
+    ops = Node(
+        name     = "opscenter",
+        host     = ops_cfg.get("host", ""),
+        ssh_user = ssh_user,
+        ssh_key  = ops_cfg.get("ssh_key", ""),
+        dse_user = dse_user,
+        use_sudo = use_sudo,
+    )
     if not ops.host:
         return []
 
-    out, rc = ssh_run(ops, f'grep -A20 "\\[agents\\]" {conf_path} 2>/dev/null', timeout)
+    # Read the [agents] block as the opscenter OS user
+    out, rc = ssh_run(ops,
+        f'grep -A30 "\\[agents\\]" {conf_path} 2>/dev/null',
+        timeout, as_dse=True)
+
+    if rc != 0 or not out.strip():
+        # Try without privilege escalation in case the SSH user can read it directly
+        out, rc = ssh_run(ops,
+            f'grep -A30 "\\[agents\\]" {conf_path} 2>/dev/null',
+            timeout, as_dse=False)
+
     if rc != 0 or not out.strip():
         return [Finding("opscenter", "opscenterd_conf", "SKIP",
-                        f"opscenterd.conf not readable at {conf_path}.")]
+                        f"opscenterd.conf not readable at {conf_path} "
+                        f"(tried as '{ssh_user}' and '{dse_user}'). "
+                        "Set dse_user: opscenter and use_sudo: true in inventory opscenter block.",
+                        f"Add to inventory.yml opscenter block:\n"
+                        f"  dse_user: opscenter\n"
+                        f"  use_sudo: true\n"
+                        f"And grant sudo on the OpsCenter host:\n"
+                        f"  {ssh_user} ALL=(opscenter) NOPASSWD: /bin/grep, /bin/cat")]
 
+    # ── SSL enabled/disabled ──────────────────────────────────────────────────
     use_ssl = bool(re.search(r"use_ssl\s*=\s*true", out, re.I))
-    findings.append(Finding("opscenter", "opscenter_use_ssl",
-                            "PASS" if use_ssl else "WARN",
-                            f"[agents] use_ssl = {'true' if use_ssl else 'false/absent'}.",
-                            "Set  use_ssl = true  in opscenterd.conf [agents]."))
+    ssl_absent = not re.search(r"use_ssl", out, re.I)
 
-    m = re.search(r"ssl_keyfile\s*=\s*(\S+)", out)
-    if m:
-        kf = m.group(1)
-        if kf.lower().endswith((".jks", ".p12", ".pfx")):
-            findings.append(Finding("opscenter", "opscenter_wrong_keyfile", "FAIL",
-                                    f"ssl_keyfile={kf} is a Java keystore — must be a PEM private key.",
-                                    "Set ssl_keyfile to OpsCenter's own PEM key "
-                                    "(/etc/opscenter/ssl/opscenter.key), NOT a DSE node JKS."))
-        else:
-            findings.append(Finding("opscenter", "opscenter_keyfile", "PASS",
-                                    f"ssl_keyfile={kf} (non-JKS)."))
+    if use_ssl:
+        findings.append(Finding("opscenter", "opscenter_use_ssl", "PASS",
+                                "[agents] use_ssl = true — SSL is enabled."))
+    elif ssl_absent:
+        findings.append(Finding("opscenter", "opscenter_use_ssl", "INFO",
+                                "[agents] use_ssl not set — SSL is disabled (default). "
+                                "Agent communication is unencrypted.",
+                                "Set  use_ssl = true  in opscenterd.conf [agents] "
+                                "to encrypt OpsCenter ↔ agent traffic."))
     else:
-        findings.append(Finding("opscenter", "opscenter_keyfile_missing", "FAIL",
-                                "ssl_keyfile not set in [agents].",
-                                "Set ssl_keyfile = /etc/opscenter/ssl/opscenter.key"))
+        findings.append(Finding("opscenter", "opscenter_use_ssl", "WARN",
+                                "[agents] use_ssl = false — SSL is explicitly disabled. "
+                                "Agent communication is unencrypted.",
+                                "Set  use_ssl = true  in opscenterd.conf [agents] "
+                                "to encrypt OpsCenter ↔ agent traffic."))
 
+    # ── ssl_keyfile: only validate when SSL is actually enabled ───────────────
+    # When use_ssl = false, the keyfile is not loaded and its absence is not a problem.
+    if use_ssl:
+        m = re.search(r"ssl_keyfile\s*=\s*(\S+)", out)
+        if m:
+            kf = m.group(1)
+            if kf.lower().endswith((".jks", ".p12", ".pfx")):
+                findings.append(Finding("opscenter", "opscenter_wrong_keyfile", "FAIL",
+                                        f"ssl_keyfile={kf} is a Java keystore — must be a PEM private key.",
+                                        "OpsCenter uses PEM format, not JKS/PKCS12. "
+                                        "Set ssl_keyfile = /etc/opscenter/ssl/opscenter.key "
+                                        "(the OpsCenter PEM private key, not a DSE node keystore)."))
+            else:
+                findings.append(Finding("opscenter", "opscenter_keyfile", "PASS",
+                                        f"ssl_keyfile={kf} (PEM format)."))
+        else:
+            findings.append(Finding("opscenter", "opscenter_keyfile_missing", "FAIL",
+                                    "ssl_keyfile not configured in [agents] but use_ssl = true.",
+                                    "Set ssl_keyfile = /etc/opscenter/ssl/opscenter.key"))
+    else:
+        # SSL off — report ssl_keyfile presence as INFO only
+        m = re.search(r"ssl_keyfile\s*=\s*(\S+)", out)
+        if m:
+            findings.append(Finding("opscenter", "opscenter_keyfile", "INFO",
+                                    f"ssl_keyfile={m.group(1)} is configured but "
+                                    "use_ssl = false so it is not active."))
+        else:
+            findings.append(Finding("opscenter", "opscenter_keyfile", "INFO",
+                                    "ssl_keyfile not set (not required when use_ssl = false)."))
+
+    # ── Agent port reachability (always checked regardless of SSL state) ──────
+    # Port 61620 = agent HTTP (used even without SSL for metrics/commands)
+    # Port 61621 = agent STOMP over SSL (only meaningful when use_ssl = true)
     for n in nodes:
         for port, label in ((61620, "agent_http"), (61621, "agent_stomp_ssl")):
             out2, _ = ssh_run(n,
                 f"nc -zv -w5 {ops.host} {port} 2>&1 || echo CLOSED", timeout)
             up = "CLOSED" not in out2 and "refused" not in out2.lower()
-            findings.append(Finding(n.name, label,
-                                    "PASS" if up else "WARN",
-                                    f"OpsCenter port {port} ({label}): "
-                                    f"{'reachable' if up else 'unreachable'}."))
+            if label == "agent_stomp_ssl" and not use_ssl:
+                # STOMP SSL port is only expected to be up when SSL is enabled
+                findings.append(Finding(n.name, label,
+                                        "INFO" if not up else "PASS",
+                                        f"OpsCenter port {port} ({label}): "
+                                        f"{'reachable' if up else 'not listening'} "
+                                        f"(SSL is disabled — port not expected to be active)."))
+            else:
+                findings.append(Finding(n.name, label,
+                                        "PASS" if up else "WARN",
+                                        f"OpsCenter port {port} ({label}): "
+                                        f"{'reachable' if up else 'unreachable'}."))
     return findings
 
 
@@ -2523,7 +2609,17 @@ def print_report(findings: List[Finding], no_colour: bool) -> None:
     )
 
     if not actionable:
-        print(f"\n  {_colour('PASS', '✓ All checks passed!', no_colour)}\n")
+        skip_count = counts.get("SKIP", 0)
+        pass_count = counts.get("PASS", 0)
+        if pass_count == 0 and skip_count > 0:
+            # Everything was skipped — no checks actually ran
+            print(f"\n  {_colour('SKIP', f'⚠ All {skip_count} check(s) were skipped — no results to evaluate.', no_colour)}")
+            print( "    Common causes:")
+            print( "      • opscenterd.conf not readable (add dse_user + use_sudo to inventory opscenter block)")
+            print( "      • Keystore/truststore config missing in cassandra.yaml")
+            print( "      • Module not applicable for this node (e.g. opscenter module on a DSE node)\n")
+        else:
+            print(f"\n  {_colour('PASS', '✓ All checks passed!', no_colour)}\n")
         print(f"{'─'*64}\n")
         return
 
