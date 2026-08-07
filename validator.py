@@ -2,63 +2,102 @@
 """
 DSE SSL Validator
 -----------------
-Sequential, gate-based SSL/TLS health checker for DSE clusters.
-Each stage must pass before the next runs. First failure exits with remediation.
-Covers DSE 5.1, 6.7, 6.8, 6.9 / OpsCenter 6.8.
+Gate-based SSL/TLS health checker for DSE clusters.
+Covers DSE 5.1, 6.7, 6.8, 6.9 / Apache Cassandra 3.11, 4.0+ / OpsCenter 6.8.
 
-Split-user support
-  SSH user  (e.g. ubuntu/ec2-user) — used for the SSH connection.
-  DSE user  (e.g. dse/cassandra)   — owns keystores, config files.
-  When they differ, the tool automatically uses  sudo -u <dse_user>
-  for file reads and keytool commands, and  sudo cat  for SCP fallback.
-  Set  dse_user  in inventory.yml defaults or per-node.
-  Set  use_sudo: true  if passwordless sudo is available (default: true
-  when dse_user is set).
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHECK MODES  (--check-mode)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  internode   Checks node-to-node SSL only:
+                config, cert, chain, trust, tls mesh, match, hostname,
+                ciphers, versions, restart, logs, privkey, alias,
+                perms, integrity, revocation
+              Port used depends on DSE/C* version (see table below).
 
-Local mode (--local)
-  Run all checks directly on the current host — no SSH, no inventory needed.
-  Useful when logged in to a DSE node or OpsCenter host:
-    python validator.py --local
-    python validator.py --local --cassandra-yaml /etc/dse/cassandra/cassandra.yaml
-    python validator.py --local --modules privkey,alias,perms,integrity
-    python validator.py --local --opscenter-host 10.1.1.10 --modules opscenter
+  client      Checks client application (CQL) SSL only:
+                config (client_encryption_options), cert, chain, trust,
+                native (9042/9142), hostname, ciphers, versions,
+                privkey, alias, perms, integrity
 
-Validation order per node:
-  Gates (run sequentially — FAIL stops further checks):
-  1.  config     — cassandra.yaml paths, passwords, protocol
-  2.  cert       — keystore path exists, expiry, key size, signature alg
-  3.  chain      — root + intermediate CA chain length, openssl verify
-  4.  trust      — truststore populated, cross-node CA coverage
+  opscenter   Checks OpsCenter ↔ agent SSL only:
+                opscenter module (opscenterd.conf, ports 61620/61621)
 
-  Independent (run in parallel within each node):
-  5.  tls        — live openssl s_client mesh (N×N-1)
-  6.  match      — keystore fingerprint vs live cert (restart detection)
-  7.  hostname   — SAN/CN vs listen_address, broadcast_address, hostname
-  8.  jmx        — port 7199 TLS
-  9.  native     — port 9042/9142 TLS
- 10.  opscenter  — opscenterd.conf, agent ports 61620/61621
- 11.  ciphers    — weak/broken cipher detection
- 12.  versions   — Java/TLS version matrix
- 13.  restart    — keystore mtime vs DSE process start
- 14.  logs       — system.log SSL errors, clock skew, runtime ports
- 15.  privkey    — private key existence, algorithm, size, cert-key match
- 16.  alias      — alias inventory: count, duplicates, chain attached
- 17.  perms      — file owner, mode, SELinux context on keystore/truststore
- 18.  integrity  — full store integrity: duplicate certs, entry counts
- 19.  revocation — CRL / OCSP revocation check via openssl
+  all         All of the above  (default)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTERNODE PORT MATRIX  ⚠ VERSION MATTERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Version                        | Non-SSL port | SSL port | Notes
+  ─────────────────────────────────────────────────────────────────────────
+  C* 3.11 / DSE 5.1 / DSE 6.8   |    7000      |   7001   | SSL only on 7001
+  DSE 6.9 < 6.9.7                |    7000      |   7001   | same as above
+  C* 4.0+ / DSE 6.9.7+           |    7000      |   7000   | SSL mux on 7000
+  ─────────────────────────────────────────────────────────────────────────
+  enable_legacy_ssl_storage_port: true  → force 7001 (any version)
+  enable_legacy_ssl_storage_port: false → force 7000
+  absent key → auto-detected from version (see above)
+
+  ⚠ Upgrading from DSE 6.8→6.9 (or C* 3.11→4.0) WITH SSL requires the
+    transition flag enable_legacy_ssl_storage_port during rolling upgrade.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTANT: PRIVATE KEY SECURITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  This tool NEVER reads or transmits private keys.
+  All keytool commands use -list or -exportcert (public data only).
+  Keystores are inspected in-place via SSH/sudo — never copied locally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SPLIT-USER SUPPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ssh_user   SSH login account  (e.g. automaton, ubuntu, ec2-user)
+  dse_user   OS account owning keystores/config  (e.g. cassandra, dse)
+  When they differ, every keytool/stat/cat runs via:
+    sudo -u <dse_user> -n <command>
+  Required sudoers:  ssh_user ALL=(dse_user) NOPASSWD: ALL
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALIDATION STAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Gates (sequential — FAIL stops further checks for that node):
+   1. config     cassandra.yaml encryption options, port config, protocol
+   2. cert       keystore accessible, expiry, key size, signature algorithm
+   3. chain      CA chain depth; root + intermediate openssl verify;
+                 Issuer DN cross-checked against truststore entries
+   4. trust      truststore accessible, ≥1 trustedCertEntry; CA rotation warn
+
+  Independent per-node (parallel):
+   5. tls        openssl s_client N×(N-1) mesh on correct internode port;
+                 1-way and 2-way SSL (require_client_auth) handled
+   6. match      keystore fingerprint vs live cert (detect unrestarded node)
+   7. hostname   SAN DNS + IP vs listen_address/broadcast/rpc/hostname;
+                 IP in SAN required when require_endpoint_verification=true
+   8. jmx        port 7199 TLS flag + handshake
+   9. native     ports 9042 / 9142 TLS (client SSL)
+  10. opscenter  opscenterd.conf [agents] ssl_keyfile, ports 61620/61621
+  11. ciphers    broken ciphers (RC4/DES/3DES/EXPORT/NULL/anon) in config
+  12. versions   Java/TLS version matrix
+  13. restart    keystore mtime vs DSE process start
+  14. logs       system.log SSL error scan, clock skew, port status
+  15. privkey    PrivateKeyEntry exists, algorithm, size, cert↔key match
+  16. alias      alias inventory, chain length, duplicate certs
+  17. perms      file owner/mode/SELinux on keystore+truststore+cassandra.yaml
+  18. integrity  store format (JKS/PKCS12), entry counts, SHA-256 duplicates
+  19. revocation OCSP (AIA extension) + CRL Distribution Point check
 
   Cluster-level (after all nodes):
-      config consistency check + TLS mesh (N×N-1 openssl s_client)
+      config consistency + TLS mesh (N×N-1)
 
-Performance model (--threads N controls both levels of parallelism):
-  Level 1 — nodes run concurrently (up to --threads nodes at once)
-  Level 2 — stages 5-19 run concurrently within each node (up to 8 workers)
-  keytool/SSH calls are cached per-node: only 2 keytool calls per node
-  regardless of how many stages use them.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERFORMANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  --threads N  controls two parallelism levels:
+    Level 1 — N nodes validate concurrently
+    Level 2 — stages 5-19 run concurrently within each node (≤8 workers)
+  keytool outputs cached per-node: only 2 keytool SSH calls per node total.
 
 Requirements: PyYAML  (pip install pyyaml)
 Target nodes: openssl, keytool, ss/nc, stat, grep — standard on any DSE host.
-
 Exit codes: 0 = PASS  |  1 = WARN  |  2 = FAIL
 """
 
@@ -756,6 +795,37 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
         ssh_run(node, f"rm -f {tmp_leaf}", timeout)
         return findings
 
+    # ── 3c-extra. Issuer ↔ truststore cross-check ────────────────────────────
+    # Verify the cert's Issuer DN is represented in the truststore.
+    # If missing, DSE cannot verify peer certificates → handshake failure.
+    issuer_out, _ = ssh_run(node,
+        f"openssl x509 -noout -issuer -in {tmp_leaf} 2>/dev/null", timeout)
+    issuer_m = re.search(r"issuer=(.+)", issuer_out)
+    issuer_dn = issuer_m.group(1).strip() if issuer_m else ""
+
+    if issuer_dn:
+        findings.append(Finding(node.name, "cert_issuer", "INFO",
+                                f"Cert Issuer DN: {issuer_dn}"))
+        # Extract all Owner/Subject lines from the verbose truststore listing
+        ts_owners = re.findall(r"Owner:\s*(.+)", ts_list_out)
+        issuer_norm = re.sub(r"\s+", "", issuer_dn).lower()
+        matched_in_ts = any(
+            issuer_norm == re.sub(r"\s+", "", o).lower() or
+            issuer_dn.lower() in o.lower()
+            for o in ts_owners
+        )
+        if matched_in_ts:
+            findings.append(Finding(node.name, "issuer_in_truststore", "PASS",
+                                    "Cert Issuer found in truststore — CA chain verified."))
+        else:
+            findings.append(Finding(
+                node.name, "issuer_in_truststore", "FAIL",
+                f"Cert Issuer '{issuer_dn}' NOT found in truststore. "
+                "Nodes cannot verify each other's certs → TLS handshake will fail.",
+                "Import the signing CA: keytool -import -trustcacerts -alias issuer-ca "
+                "-file issuer-ca.pem -keystore truststore.jks",
+            ))
+
     # Separate root CAs (self-signed) from intermediates
     root_pems   = []
     inter_pems  = []
@@ -904,6 +974,20 @@ def check_trust(node: Node, timeout: int) -> List[Finding]:
     findings.append(Finding(node.name, "truststore", "PASS",
                             f"Truststore accessible — {entry_count} trusted CA "
                             f"entr{'y' if entry_count == 1 else 'ies'} found."))
+
+    # ── CA rotation warning ───────────────────────────────────────────────────
+    # If truststore has exactly 1 entry during an active cert operation,
+    # a CA rotation may break nodes still holding the old cert.
+    if entry_count == 1:
+        findings.append(Finding(
+            node.name, "truststore_single_ca", "WARN",
+            "Truststore has exactly 1 CA entry. "
+            "If you are rotating the CA, both old and new root CAs must be "
+            "present simultaneously during the rolling cert update.",
+            "Add the new CA: keytool -import -trustcacerts -alias new-root-ca "
+            "-file new-ca.pem -keystore truststore.jks  "
+            "(remove old CA only after all nodes have been updated).",
+        ))
     return findings
 
 
@@ -933,9 +1017,20 @@ _TLS_ERRORS = [
 
 def check_tls_pair(src: Node, tgt_host: str, tgt_name: str,
                    port: int, timeout: int) -> List[Finding]:
-    label  = f"{src.name}→{tgt_name}"
-    ts     = _enc(src).get("truststore", "")
-    ca_arg = f"-CAfile {ts}" if ts else ""
+    """
+    Test SSL handshake from src → tgt_host:port.
+
+    Handles both 1-way and 2-way SSL:
+      1-way (default): openssl s_client -CAfile <truststore>
+      2-way (require_client_auth=true): must present a client cert.
+        Since we cannot export the private key, we detect the config
+        and report the correct test command instead of attempting it.
+    """
+    label   = f"{src.name}→{tgt_name}"
+    enc_src = _enc(src)
+    ts      = enc_src.get("truststore", "")
+    ca_arg  = f"-CAfile {ts}" if ts else ""
+    two_way = bool(enc_src.get("require_client_auth", False))
 
     # TCP reachability first
     tcp_out, _ = ssh_run(src,
@@ -946,7 +1041,19 @@ def check_tls_pair(src: Node, tgt_host: str, tgt_name: str,
                         f"[{label}] TCP to {tgt_host}:{port} unreachable.",
                         f"Check firewall rules for port {port} between nodes.")]
 
-    # TLS handshake
+    # 2-way SSL: we cannot provide the client private key, so report the
+    # correct manual test command and skip the automated handshake attempt.
+    if two_way:
+        ks  = enc_src.get("keystore", "<keystore>")
+        pwd = enc_src.get("keystore_password", "<password>")
+        return [Finding(src.name, "tls_two_way_ssl", "INFO",
+                        f"[{label}] require_client_auth=true (2-way SSL) on port {port}. "
+                        "Automated handshake skipped (cannot use private key). "
+                        "Manual test command:",
+                        f"openssl s_client -showcerts -connect {tgt_host}:{port} "
+                        f"{ca_arg} -key <private.key> -cert <signed.crt>")]
+
+    # 1-way TLS handshake
     hs_out, _ = ssh_run(src,
         f"echo | timeout {timeout} openssl s_client "
         f"-connect {tgt_host}:{port} {ca_arg} -showcerts 2>&1",
@@ -982,32 +1089,45 @@ def check_tls_pair(src: Node, tgt_host: str, tgt_name: str,
 
 def _internode_ssl_port(node: Node) -> int:
     """
-    Return the port DSE uses for encrypted internode traffic.
+    Return the port DSE/C* uses for encrypted internode traffic.
 
-    DSE behaviour:
-      enable_legacy_ssl_storage_port: true  → 7001 (dedicated SSL port)
-      enable_legacy_ssl_storage_port: false → 7000 (SSL multiplexed on
-                                               the normal storage port)
-      key absent                            → same as false for DSE 6.x
-                                             (true for DSE 5.x, but we
-                                              default safe to 7001 there)
+    Version matrix (from official DSE/C* documentation):
+      C* 3.11 / DSE 5.1 / DSE 6.8 / DSE 6.9 < 6.9.7:
+        → port 7001  (dedicated SSL storage port; 7000 = plaintext only)
+      C* 4.0+ / DSE 6.9.7+:
+        → port 7000  (SSL multiplexed on the standard storage port)
 
-    The function checks cassandra.yaml; if the key is absent it falls back
-    to the DSE version heuristic (6.x → 7000, older → 7001).
+    cassandra.yaml override (takes precedence over version heuristic):
+      enable_legacy_ssl_storage_port: true  → always 7001
+      enable_legacy_ssl_storage_port: false → always 7000
+      (absent) → version heuristic below
+
+    ⚠ During a rolling upgrade from DSE 6.8→6.9 or C* 3.11→4.0 WITH SSL,
+      enable_legacy_ssl_storage_port must be set to ease the transition.
     """
     yaml_val = node.yaml_data.get("enable_legacy_ssl_storage_port")
 
     if yaml_val is True:
         return 7001
-
     if yaml_val is False:
         return 7000
 
-    # Key absent — infer from DSE version
-    dv = node.dse_version or ""
-    major_m = re.match(r"(\d+)\.", dv)
-    major = int(major_m.group(1)) if major_m else 0
-    return 7000 if major >= 6 else 7001
+    # Key absent — derive from DSE/C* version string
+    dv = (node.dse_version or "").strip()
+
+    # DSE 6.9.7+ uses port 7000 for SSL (multiplexed)
+    m697 = re.match(r"6\.9\.(\d+)", dv)
+    if m697 and int(m697.group(1)) >= 7:
+        return 7000
+
+    # C* 4.0+ (version strings like "4.0.0", "4.1.3", "5.0.0")
+    ca_m = re.match(r"(\d+)\.", dv)
+    if ca_m and int(ca_m.group(1)) >= 4:
+        return 7000
+
+    # DSE 5.x, 6.7, 6.8, DSE 6.9 < 6.9.7 → 7001
+    # Also the safe default when version is unknown
+    return 7001
 
 
 def check_tls_mesh(nodes: List[Node], timeout: int, threads: int) -> List[Finding]:
@@ -1118,11 +1238,22 @@ def check_hostname(node: Node, timeout: int) -> List[Finding]:
             any(addr_val.endswith("." + d.lstrip("*.")) for d in san_dns)
         )
         if not matched:
-            sev = "FAIL" if rev and addr_type in ("listen_address", "hostname") else "WARN"
+            # require_endpoint_verification=true → FAIL for any unmatched listen/broadcast IP
+            # or FQDN used as listen address; IPs MUST be in SAN (not CN) per RFC 6125.
+            if rev and addr_type in ("listen_address", "broadcast_address", "hostname"):
+                sev = "FAIL"
+                fix = (f"Add {addr_val} to the certificate SAN "
+                       f"({'as an IP SAN entry' if is_ip else 'as a DNS SAN entry'}) "
+                       f"— require_endpoint_verification=true is active, "
+                       f"DSE rejects connections where the peer address is absent from SAN. "
+                       f"IPs must be listed as IP SAN entries, not in CN.")
+            else:
+                sev = "WARN"
+                fix = ("Add the IP/hostname to the certificate SAN, "
+                       "or set require_endpoint_verification: false.")
             findings.append(Finding(node.name, "san_mismatch", sev,
                                     f"{addr_type}={addr_val} not present in cert SAN/CN.",
-                                    "Add the IP/hostname to the certificate SAN, "
-                                    "or set require_endpoint_verification: false."))
+                                    fix))
     return findings
 
 
@@ -2380,8 +2511,16 @@ def run(args) -> int:
     run_id   = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     work_dir = tempfile.mkdtemp(prefix=f"dse-ssl-{run_id}-")
 
-    active = (set(ALL_MODULES) if args.modules == "all"
-              else {m.strip() for m in args.modules.split(",")})
+    # Resolve active module set:
+    #   1. If -m/--modules is explicitly provided → use exactly those modules.
+    #   2. Otherwise use --check-mode to pick from _MODE_MODULES.
+    if args.modules:
+        active: set = {m.strip() for m in args.modules.split(",") if m.strip()}
+        mode_label = f"modules={args.modules}"
+    else:
+        mode_key   = getattr(args, "check_mode", "all")
+        active     = set(_MODE_MODULES.get(mode_key, ALL_MODULES))
+        mode_label = f"check-mode={mode_key}"
 
     # ── Local mode — build a synthetic single-node inventory ─────────────────
     if _LOCAL_MODE:
@@ -2434,7 +2573,7 @@ def run(args) -> int:
         all_findings: List[Finding] = []
 
         print(f"\nDSE SSL Validator  │  LOCAL mode  │  host={local_node.name}  "
-              f"│  modules={args.modules}")
+              f"│  {mode_label}")
         print("─" * 64)
 
         validate_node(local_node, active, args, all_findings)
@@ -2472,7 +2611,7 @@ def run(args) -> int:
         }
 
     print(f"\nDSE SSL Validator  │  cluster={cluster_name}  "
-          f"│  nodes={len(nodes)}  │  modules={args.modules}")
+          f"│  nodes={len(nodes)}  │  {mode_label}")
     print("─" * 64)
 
     # ── Parallel collect ──────────────────────────────────────────────────────
@@ -2548,20 +2687,49 @@ def run(args) -> int:
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Module sets for each check mode
+_MODE_MODULES = {
+    "internode":  ["config", "cert", "chain", "trust", "tls", "match",
+                   "hostname", "jmx", "ciphers", "versions", "restart",
+                   "logs", "privkey", "alias", "perms", "integrity", "revocation"],
+    "client":     ["config", "cert", "chain", "trust", "native",
+                   "hostname", "ciphers", "versions",
+                   "privkey", "alias", "perms", "integrity"],
+    "opscenter":  ["opscenter"],
+    "all":        ALL_MODULES,
+}
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="DSE SSL Validator — sequential gate-based cluster SSL/TLS checker",
+        description="DSE SSL Validator — gate-based SSL/TLS checker for DSE clusters",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Validation order (each stage gates the next on FAIL):\n"
-            "  config → cert → chain → trust → tls → match → hostname\n"
-            "  → jmx → native → opscenter → ciphers → versions → restart → logs\n"
-            "  → privkey → alias → perms → integrity → revocation\n\n"
-            f"Modules: {', '.join(ALL_MODULES)}\n\n"
-            "Local mode examples (run directly on a DSE node — no SSH needed):\n"
-            "  python validator.py --local\n"
-            "  python validator.py --local --modules privkey,alias,perms,integrity\n"
-            "  python validator.py --local --opscenter-host 10.1.1.10\n\n"
+            "━━ CHECK MODES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  --check-mode internode   Node-to-node SSL (ports 7000/7001)\n"
+            "  --check-mode client      Client CQL SSL (ports 9042/9142)\n"
+            "  --check-mode opscenter   OpsCenter ↔ agent SSL (ports 61620/61621)\n"
+            "  --check-mode all         All of the above (default)\n\n"
+            "━━ INTERNODE PORT MATRIX ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  DSE 5.1 / 6.8 / 6.9<6.9.7  →  SSL on port 7001\n"
+            "  DSE 6.9.7+ / C* 4.0+        →  SSL on port 7000 (multiplexed)\n"
+            "  enable_legacy_ssl_storage_port in cassandra.yaml overrides this.\n\n"
+            "━━ EXAMPLES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  # Full cluster check\n"
+            "  python validator.py -i inventory.yml\n\n"
+            "  # Node-to-node SSL only\n"
+            "  python validator.py -i inventory.yml --check-mode internode\n\n"
+            "  # Client SSL only\n"
+            "  python validator.py -i inventory.yml --check-mode client\n\n"
+            "  # OpsCenter SSL only\n"
+            "  python validator.py -i inventory.yml --check-mode opscenter\n\n"
+            "  # Specific nodes only (debug)\n"
+            "  python validator.py -i inventory.yml --nodes node1,node2 --log-level DEBUG\n\n"
+            "  # Run on this DSE node directly (no SSH)\n"
+            "  python validator.py --local --check-mode internode\n\n"
+            "  # Key/store audit only on specific node\n"
+            "  python validator.py -i inventory.yml --nodes node1 -m privkey,alias,integrity\n\n"
+            f"Modules: {', '.join(ALL_MODULES)}\n"
             "Exit:    0=PASS  1=WARN  2=FAIL"
         ),
     )
@@ -2575,8 +2743,14 @@ def main():
     # ── Output ────────────────────────────────────────────────────────────────
     p.add_argument("-o", "--output",   default="reports/",
                    metavar="DIR",   help="Output directory for JSON report  (default: reports/)")
-    p.add_argument("-m", "--modules",  default="all",
-                   metavar="LIST",  help="Comma-separated modules or 'all'  (default: all)")
+    p.add_argument("--check-mode",    default="all",
+                   choices=["internode", "client", "opscenter", "all"],
+                   help="What to check: internode | client | opscenter | all  (default: all)")
+    p.add_argument("-m", "--modules",  default="",
+                   metavar="LIST",
+                   help="Override specific modules (comma-separated). "
+                        "If set, --check-mode is ignored.  "
+                        f"Choices: {', '.join(ALL_MODULES)}")
     p.add_argument("--nodes",          default="",
                    metavar="LIST",  help="Comma-separated node names to restrict run (SSH mode)")
 

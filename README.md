@@ -1,14 +1,17 @@
 # DSE SSL Validator
 
-A lightweight, **single-file** SSL/TLS health checker for Apache Cassandra / DSE clusters.  
+A lightweight, **single-file** SSL/TLS health checker for Apache Cassandra / DSE clusters.
 Covers **DSE 5.1, 6.7, 6.8, 6.9** and **OpsCenter 6.8** — built for IBM DataStax Support Engineering.
 
 ```bash
-# SSH cluster mode
+# SSH cluster mode — full check
 python3 validator.py -i inventory.yml
 
+# SSH cluster mode — internode SSL only
+python3 validator.py -i inventory.yml --check-mode internode
+
 # Local mode — run directly ON a DSE node, no SSH needed
-python3 validator.py --local
+python3 validator.py --local --check-mode client
 ```
 
 ---
@@ -27,18 +30,60 @@ python3 validator.py --local
 ## Table of Contents
 
 1. [What it checks](#what-it-checks)
-2. [Installation](#installation)
-3. [Quick start](#quick-start)
-4. [Usage](#usage)
-5. [All CLI options](#all-cli-options)
-6. [Local mode](#local-mode--run-directly-on-a-dse-node)
-7. [Node discovery — gen-inventory.py](#node-discovery--gen-inventorypy)
-8. [Split-user support](#split-user-support-ssh-user--dse-user)
-9. [OpsCenter validation](#opscenter-validation)
-10. [Output format](#output-format)
-11. [Target node requirements](#target-node-requirements)
-12. [Exit codes](#exit-codes)
-13. [Validation order (gate-based)](#validation-order-gate-based)
+2. [Check modes](#check-modes)
+3. [Internode port matrix](#internode-port-matrix)
+4. [Installation](#installation)
+5. [Quick start](#quick-start)
+6. [Usage](#usage)
+7. [All CLI options](#all-cli-options)
+8. [Local mode](#local-mode--run-directly-on-a-dse-node)
+9. [Node discovery — gen-inventory.py](#node-discovery--gen-inventorypy)
+10. [Split-user support](#split-user-support-ssh-user--dse-user)
+11. [OpsCenter validation](#opscenter-validation)
+12. [Output format](#output-format)
+13. [Target node requirements](#target-node-requirements)
+14. [Exit codes](#exit-codes)
+15. [Validation order (gate-based)](#validation-order-gate-based)
+
+---
+
+## Check modes
+
+Use `--check-mode` to restrict the validator to one SSL layer at a time.
+`-m/--modules` overrides `--check-mode` when you need a custom subset.
+
+| Mode | What is validated | Typical use |
+|------|-------------------|-------------|
+| `internode` | Node-to-node SSL (ports 7000/7001): config, cert, chain, trust, tls mesh, match, hostname, jmx, ciphers, versions, restart, logs, privkey, alias, perms, integrity, revocation | Diagnosing gossip/internode TLS failures |
+| `client` | Client CQL SSL (ports 9042/9142): config, cert, chain, trust, native, hostname, ciphers, versions, privkey, alias, perms, integrity | Diagnosing CQLSH/driver connection failures |
+| `opscenter` | OpsCenter ↔ agent SSL (ports 61620/61621) | Diagnosing OpsCenter agent disconnects |
+| `all` | All 19 modules **(default)** | Full audit |
+
+```bash
+python validator.py -i inventory.yml --check-mode internode
+python validator.py -i inventory.yml --check-mode client
+python validator.py -i inventory.yml --check-mode opscenter
+python validator.py -i inventory.yml --check-mode all        # default
+
+# -m overrides --check-mode for ad-hoc debugging
+python validator.py -i inventory.yml -m privkey,alias,integrity
+```
+
+---
+
+## Internode port matrix
+
+DSE/C* version determines which port carries encrypted internode traffic.
+
+| Version | Non-SSL port | SSL port | Notes |
+|---------|-------------|----------|-------|
+| DSE 5.1 | 7000 | 7001 | `internode_encryption: all` |
+| DSE 6.8 | 7000 | 7001 | `internode_encryption: all` |
+| DSE 6.9 < 6.9.7 | 7000 | 7001 | `internode_encryption: all` |
+| **DSE 6.9.7+** | — | **7000** | Multiplexed — SSL on the main port |
+| **C* 4.0+** | — | **7000** | `enable_legacy_ssl_storage_port: false` |
+
+> `enable_legacy_ssl_storage_port: false` in `cassandra.yaml` forces SSL on port 7000 regardless of version.
 
 ---
 
@@ -124,7 +169,7 @@ python validator.py -i inventory.yml
 **3. Read the output:**
 
 ```
-DSE SSL Validator  │  cluster=MyCluster  │  nodes=3  │  modules=all
+DSE SSL Validator  │  cluster=MyCluster  │  nodes=3  │  check-mode=all
 ────────────────────────────────────────────────────────────────────
 
   [FAIL]  node2             cert_expiry
@@ -155,17 +200,26 @@ DSE SSL Validator  │  cluster=MyCluster  │  nodes=3  │  modules=all
 ## Usage
 
 ```bash
-# Full cluster validation
+# Full cluster validation (all 19 modules)
 python validator.py -i inventory.yml
 
-# Specific modules only
+# Node-to-node SSL only
+python validator.py -i inventory.yml --check-mode internode
+
+# Client CQL SSL only
+python validator.py -i inventory.yml --check-mode client
+
+# OpsCenter SSL only
+python validator.py -i inventory.yml --check-mode opscenter
+
+# Specific modules only (-m overrides --check-mode)
 python validator.py -i inventory.yml -m cert,trust,tls
 
-# New security modules only
+# Security audit modules only
 python validator.py -i inventory.yml -m privkey,alias,perms,integrity,revocation
 
-# Single node
-python validator.py -i inventory.yml --nodes node1
+# Single node with debug output
+python validator.py -i inventory.yml --nodes node1 --log-level DEBUG
 
 # Adjust cert expiry thresholds
 python validator.py -i inventory.yml --warn-days 60 --fail-days 14
@@ -175,9 +229,6 @@ python validator.py -i inventory.yml -o reports/ ; echo "Exit: $?"
 
 # No colour (for log files / CI)
 python validator.py -i inventory.yml --no-colour
-
-# Debug SSH and module execution
-python validator.py -i inventory.yml --log-level DEBUG
 ```
 
 ---
@@ -190,27 +241,27 @@ Mode (pick one):
   --local                 run all checks locally on THIS host — no SSH needed
 
 Output:
-  -o, --output    DIR     report output directory          (default: reports/)
-  -m, --modules   LIST    comma-separated modules or 'all' (default: all)
-      --nodes     LIST    restrict run to named nodes      (SSH mode only)
+  -o, --output     DIR    report output directory             (default: reports/)
+  --check-mode     MODE   internode | client | opscenter | all  (default: all)
+  -m, --modules    LIST   comma-separated modules — overrides --check-mode
+  --nodes          LIST   restrict run to named nodes (SSH mode only)
 
 Thresholds:
-      --warn-days INT     cert expiry warning threshold    (default: 30 days)
-      --fail-days INT     cert expiry failure threshold    (default:  7 days)
-      --timeout   INT     SSH / openssl timeout seconds    (default: 10)
-      --threads   INT     parallel SSH workers             (default:  4)
+      --warn-days  INT    cert expiry warning threshold       (default: 30 days)
+      --fail-days  INT    cert expiry failure threshold       (default:  7 days)
+      --timeout    INT    SSH / openssl timeout seconds       (default: 10)
+      --threads    INT    parallel workers (node + stage)     (default:  8)
 
 Local mode / OpsCenter:
       --cassandra-yaml PATH   cassandra.yaml for --local mode
                               (default: /etc/dse/cassandra/cassandra.yaml)
-      --opscenter-host HOST   OpsCenter IP — usable in both SSH and --local mode;
-                              overrides inventory opscenter block
+      --opscenter-host HOST   OpsCenter IP — overrides inventory opscenter block
       --opscenter-conf PATH   opscenterd.conf path for --opscenter-host
                               (default: /etc/opscenter/opscenterd.conf)
 
 Display:
       --no-colour         disable ANSI colours
-      --log-level LEVEL   DEBUG | INFO | WARNING           (default: WARNING)
+      --log-level LEVEL   DEBUG | INFO | WARNING             (default: WARNING)
 ```
 
 ---
