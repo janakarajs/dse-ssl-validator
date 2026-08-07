@@ -1571,21 +1571,51 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
     agents  = _parse_ini_section(full_conf, "agents")
     webserv = _parse_ini_section(full_conf, "webserver")
 
-    # ── A1. use_ssl ───────────────────────────────────────────────────────────
+    # ── A1. OpsCenter-side SSL gate ───────────────────────────────────────────
+    # use_ssl in opscenterd.conf [agents] is the master switch.
+    # All SSL-specific checks (files, keystores, agent config) only make sense
+    # when this is true. Report the state clearly and stop SSL checks if off.
     use_ssl    = agents.get("use_ssl", "").lower() == "true"
     ssl_absent = "use_ssl" not in agents
 
     if use_ssl:
         findings.append(Finding("opscenter", "ops_use_ssl", "PASS",
-                                "[agents] use_ssl = true — Stomp SSL enabled."))
-    elif ssl_absent:
-        findings.append(Finding("opscenter", "ops_use_ssl", "INFO",
-                                "[agents] use_ssl not set — agent communication is unencrypted.",
-                                "Set  use_ssl = true  in opscenterd.conf [agents]."))
+                                "opscenterd.conf [agents] use_ssl = true — "
+                                "OpsCenter Stomp SSL is enabled."))
     else:
-        findings.append(Finding("opscenter", "ops_use_ssl", "WARN",
-                                "[agents] use_ssl = false — agent communication is explicitly unencrypted.",
-                                "Set  use_ssl = true  in opscenterd.conf [agents]."))
+        sev = "WARN" if ssl_absent else "WARN"
+        msg = ("opscenterd.conf [agents] use_ssl not configured — "
+               "OpsCenter SSL is OFF. Agent communication is unencrypted."
+               if ssl_absent else
+               "opscenterd.conf [agents] use_ssl = false — "
+               "OpsCenter SSL is explicitly disabled. Agent communication is unencrypted.")
+        findings.append(Finding("opscenter", "ops_use_ssl", "WARN", msg,
+                                "Set  use_ssl = true  in opscenterd.conf [agents] "
+                                "and restart opscenterd."))
+        # OpsCenter SSL is off — still check every agent to detect
+        # the opposite mismatch: agent has use_ssl:1 but OpsCenter does not.
+        # That means the agent will try to connect with SSL but OpsCenter
+        # won't respond in kind — the connection will fail silently.
+        agent_yaml_path = "/var/lib/datastax-agent/conf/address.yaml"
+        for n in nodes:
+            ay_out, _ = ssh_run(n,
+                f"cat {agent_yaml_path} 2>/dev/null", timeout, as_dse=True)
+            if ay_out.strip():
+                ay_ssl = re.search(r"use_ssl\s*:\s*1", ay_out)
+                if ay_ssl:
+                    findings.append(Finding(n.name, "agent_use_ssl", "FAIL",
+                                            "address.yaml has use_ssl: 1 but opscenterd.conf "
+                                            "does NOT have use_ssl = true — "
+                                            "agent will attempt SSL but OpsCenter is not listening with SSL. "
+                                            "Connection will fail.",
+                                            "Either set use_ssl = true in opscenterd.conf [agents] "
+                                            "OR remove use_ssl: 1 from address.yaml — both sides must match."))
+                else:
+                    findings.append(Finding(n.name, "agent_use_ssl", "INFO",
+                                            "address.yaml use_ssl not set — "
+                                            "consistent with OpsCenter SSL being disabled."))
+        # Skip all SSL-specific checks — nothing more to validate without SSL
+        return findings
 
     # ── A2. OpsCenter SSL files (only when SSL is enabled) ────────────────────
     # Required files in ssl_dir:
@@ -1694,18 +1724,21 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
             findings.append(Finding(n.name, "agent_address_yaml", "PASS",
                                     f"address.yaml found at {agent_yaml}."))
 
-            # B2. use_ssl in address.yaml
+            # B2. Agent use_ssl must match OpsCenter use_ssl=true (reached here)
+            # Both sides must be on for SSL to work end-to-end.
             ay_use_ssl = re.search(r"use_ssl\s*:\s*1", ay_out)
-            if use_ssl and not ay_use_ssl:
-                findings.append(Finding(n.name, "agent_use_ssl", "FAIL",
-                                        "address.yaml use_ssl: 1 not set but OpsCenter has use_ssl=true.",
-                                        "Add  use_ssl: 1  to address.yaml and restart datastax-agent."))
-            elif ay_use_ssl:
+            if ay_use_ssl:
                 findings.append(Finding(n.name, "agent_use_ssl", "PASS",
-                                        "address.yaml use_ssl: 1 — agent Stomp SSL enabled."))
+                                        "address.yaml use_ssl: 1 — "
+                                        "agent SSL matches OpsCenter (both enabled)."))
             else:
-                findings.append(Finding(n.name, "agent_use_ssl", "INFO",
-                                        "address.yaml use_ssl not set — agent using plaintext Stomp."))
+                # OpsCenter has SSL on but this agent does not — mismatch
+                findings.append(Finding(n.name, "agent_use_ssl", "FAIL",
+                                        "address.yaml use_ssl: 1 not set — "
+                                        "OpsCenter expects SSL (use_ssl = true) but this agent "
+                                        "will connect via plaintext. Connection will fail.",
+                                        "Add  use_ssl: 1  to address.yaml "
+                                        "and restart datastax-agent."))
 
             # B3. stomp_interface points to OpsCenter host
             stomp_m = re.search(r"stomp_interface\s*:\s*(\S+)", ay_out)
