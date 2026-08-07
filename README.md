@@ -1,119 +1,68 @@
 # DSE SSL Validator
 
-A lightweight, **single-file** SSL/TLS health checker for Apache Cassandra / DSE clusters.
-Covers **DSE 5.1, 6.7, 6.8, 6.9** and **OpsCenter 6.8** — built for IBM DataStax Support Engineering.
+A lightweight, single-file SSL/TLS health checker for Apache Cassandra and DSE clusters.  
+Built for IBM DataStax Support Engineering. Covers **DSE 5.1, 6.7, 6.8, 6.9** and **OpsCenter 6.8**.
 
-```bash
-# SSH cluster mode — full check
-python3 validator.py -i inventory.yml
-
-# SSH cluster mode — internode SSL only
-python3 validator.py -i inventory.yml --check-mode internode
-
-# Local mode — run directly ON a DSE node, no SSH needed
-python3 validator.py --local --check-mode client
 ```
-
----
-
-## Bug fixes (v2.1)
-
-| Issue | Root cause | Fix |
-|-------|-----------|-----|
-| `privkey_alg_unsupported` — *"Key algorithm '2048-BIT' is not supported"* | Regex `(\d+)[- ]bit` matched the key-size token (e.g. `2048-bit`) instead of the algorithm name | Two separate regex chains for algorithm and size; algorithm normalisation map |
-| `alias_type_mismatch` — *"Configured alias 'cassandra' not in keystore"* | Alias hardcoded to `cassandra` everywhere | `_ks_alias()` helper: auto-discovers first `PrivateKeyEntry` in keystore; no config required |
-| `cipher_suites_empty` reported as `WARN` | JVM default ciphers are secure in DSE 6.x; absence is not a problem | Downgraded to `INFO` |
-| `perms_keystore_owner` false FAIL when files are `cassandra:cassandra` but SSH user is `automaton` | Ownership check compared only `owner`, ignoring group; `stat` ran with `as_dse=True` | `stat` without privilege escalation; pass if `owner == dse_user` **or** `group == dse_user` |
+python3 validator.py -i inventory.yml --check-mode internode
+```
 
 ---
 
 ## Table of Contents
 
-1. [What it checks](#what-it-checks)
-2. [Check modes](#check-modes)
-3. [Internode port matrix](#internode-port-matrix)
-4. [Installation](#installation)
-5. [Quick start](#quick-start)
-6. [Usage](#usage)
-7. [All CLI options](#all-cli-options)
-8. [Local mode](#local-mode--run-directly-on-a-dse-node)
-9. [Node discovery — gen-inventory.py](#node-discovery--gen-inventorypy)
-10. [Split-user support](#split-user-support-ssh-user--dse-user)
-11. [OpsCenter validation](#opscenter-validation)
+1. [Requirements](#requirements)
+2. [Installation](#installation)
+3. [Inventory file](#inventory-file)
+4. [Check modes](#check-modes)
+5. [Usage examples](#usage-examples)
+6. [All CLI options](#all-cli-options)
+7. [Local mode](#local-mode)
+8. [Node discovery](#node-discovery--gen-inventorypy)
+9. [Split-user support](#split-user-support)
+10. [OpsCenter validation](#opscenter-validation)
+11. [Module reference](#module-reference)
 12. [Output format](#output-format)
-13. [Target node requirements](#target-node-requirements)
+13. [Validation order](#validation-order-gate-based)
 14. [Exit codes](#exit-codes)
-15. [Validation order (gate-based)](#validation-order-gate-based)
 
 ---
 
-## Check modes
+## Requirements
 
-Use `--check-mode` to restrict the validator to one SSL layer at a time.
-`-m/--modules` overrides `--check-mode` when you need a custom subset.
+### Control machine (where you run the validator)
 
-| Mode | What is validated | Typical use |
-|------|-------------------|-------------|
-| `internode` | Node-to-node SSL (ports 7000/7001): config, cert, chain, trust, tls mesh, match, hostname, jmx, ciphers, versions, restart, logs, privkey, alias, perms, integrity, revocation | Diagnosing gossip/internode TLS failures |
-| `client` | Client CQL SSL (ports 9042/9142): config, cert, chain, trust, native, hostname, ciphers, versions, privkey, alias, perms, integrity | Diagnosing CQLSH/driver connection failures |
-| `opscenter` | OpsCenter ↔ agent SSL (ports 61620/61621) | Diagnosing OpsCenter agent disconnects |
-| `all` | All 19 modules **(default)** | Full audit |
+| Requirement | Notes |
+|-------------|-------|
+| Python 3.8+ | Standard library only + one pip package |
+| `pyyaml` | `pip install pyyaml` |
+| `ssh` / `scp` | Standard OpenSSH client |
 
-```bash
-python validator.py -i inventory.yml --check-mode internode
-python validator.py -i inventory.yml --check-mode client
-python validator.py -i inventory.yml --check-mode opscenter
-python validator.py -i inventory.yml --check-mode all        # default
+### Target DSE nodes (no installation required)
 
-# -m overrides --check-mode for ad-hoc debugging
-python validator.py -i inventory.yml -m privkey,alias,integrity
+The following tools must be present on each DSE node — they are standard on any DSE host:
+
+| Tool | Used for |
+|------|----------|
+| `openssl` | TLS handshake mesh, cert verification, OCSP/CRL, fingerprint comparison |
+| `keytool` | Keystore/truststore inspection and cert export |
+| `ss` / `netstat` | Port listening status |
+| `nc` | TCP reachability checks |
+| `stat` | File mtime (restart detection) and permissions |
+| `grep` / `ps` | Log scanning and process detection |
+| `curl` / `wget` | CRL download (revocation module only) |
+| `timedatectl` | Clock skew detection |
+| `selinuxenabled` / `ls -Z` | SELinux context check (optional) |
+
+### Sudo requirement (split-user environments)
+
+When the SSH login user differs from the DSE OS user (e.g. SSH as `ubuntu`, DSE owned by `cassandra`), passwordless sudo is required on each node:
+
 ```
-
----
-
-## Internode port matrix
-
-DSE/C* version determines which port carries encrypted internode traffic.
-
-| Version | Non-SSL port | SSL port | Notes |
-|---------|-------------|----------|-------|
-| DSE 5.1 | 7000 | 7001 | `internode_encryption: all` |
-| DSE 6.8 | 7000 | 7001 | `internode_encryption: all` |
-| DSE 6.9 < 6.9.7 | 7000 | 7001 | `internode_encryption: all` |
-| **DSE 6.9.7+** | — | **7000** | Multiplexed — SSL on the main port |
-| **C* 4.0+** | — | **7000** | `enable_legacy_ssl_storage_port: false` |
-
-> `enable_legacy_ssl_storage_port: false` in `cassandra.yaml` forces SSL on port 7000 regardless of version.
-
----
-
-## What it checks
-
-19 modules across every layer of DSE SSL/TLS security:
-
-| # | Module | What is validated |
-|---|--------|-------------------|
-| 1 | **config** | `server_encryption_options`, `client_encryption_options`, deprecated protocols, blank passwords, `enable_legacy_ssl_storage_port`, cross-node config consistency |
-| 2 | **cert** | X.509 expiry, not-yet-valid window, weak signature algorithm (MD5/SHA1), key size < 2048, wrong entry type, keystore password |
-| 3 | **chain** | Root + intermediate CA chain depth, `openssl verify` against truststore, CA expiry |
-| 4 | **trust** | Truststore populated, password correct, at least one `trustedCertEntry` |
-| 5 | **tls** | Full N×(N-1) `openssl s_client` mesh — protocol, cipher, verify return code, TCP reachability |
-| 6 | **match** | Keystore fingerprint vs live TLS fingerprint — detects unrestarted node after cert rotation |
-| 7 | **hostname** | SAN/CN vs `listen_address`, `broadcast_address`, `rpc_address`, `hostname -f` |
-| 8 | **jmx** | JMX SSL JVM flags (`jmxremote.ssl=true`), port 7199 TLS handshake |
-| 9 | **native** | Port 9042 / 9142 TLS handshake with `openssl s_client` |
-| 10 | **opscenter** | `opscenterd.conf [agents]` `use_ssl`, `ssl_keyfile` must be PEM (not JKS), agent ports 61620/61621 |
-| 11 | **ciphers** | Broken ciphers (RC4, DES, 3DES, EXPORT, NULL, anon) in config and live negotiation |
-| 12 | **versions** | Java/TLS version matrix — Java 8u261+, 11, 17 × DSE version, DSE 6.9 Java 17 warning |
-| 13 | **restart** | Keystore/truststore `mtime` vs DSE process start — detects cert rotation without restart |
-| 14 | **logs** | `system.log` SSL error patterns, clock skew (`timedatectl`), runtime port status |
-| 15 | **privkey** | ⭐ Private key existence, algorithm (RSA/EC), size, cert↔key match, configured alias exists |
-| 16 | **alias** | ⭐ Alias inventory — one PKE required, duplicates, chain attached to PrivateKeyEntry |
-| 17 | **perms** | ⭐ File owner, octal permissions, SELinux context on keystore/truststore/cassandra.yaml |
-| 18 | **integrity** | ⭐ Full store integrity — password, JKS vs PKCS12, entry counts, duplicate SHA-256 fingerprints |
-| 19 | **revocation** | ⭐ OCSP (AIA extension) + CRL Distribution Point revocation check via openssl |
-
-> ⭐ = newly added modules (15–19)
+ubuntu ALL=(cassandra) NOPASSWD: ALL
+# or scope to specific binaries:
+ubuntu ALL=(cassandra) NOPASSWD: /usr/bin/keytool, /usr/bin/stat, /bin/cat
+```
 
 ---
 
@@ -125,27 +74,25 @@ cd dse-ssl-validator
 pip install pyyaml
 ```
 
-**That's it.** One Python dependency. Uses your system `ssh` / `scp` / `openssl` / `keytool`.
+No other setup. The tool uses your system `ssh`, `scp`, `openssl`, and `keytool`.
 
 ---
 
-## Quick start
+## Inventory file
 
-### SSH cluster mode
-
-**1. Edit `inventory.yml`** with your cluster nodes:
+Create `inventory.yml` with your cluster nodes before running in SSH mode.
 
 ```yaml
 cluster_name: MyCluster
-dse_version: "6.8"
+dse_version: "6.9"
 
 defaults:
-  ssh_user:  ubuntu
-  ssh_key:   ~/.ssh/id_rsa
-  ssh_port:  22
-  dse_user:  cassandra   # OS user owning keystores/config
-  use_sudo:  true        # sudo -u cassandra (NOPASSWD required)
-  ssl_dir:   /etc/dse/ssl
+  ssh_user:       ubuntu        # SSH login account
+  ssh_key:        ~/.ssh/id_rsa
+  ssh_port:       22
+  dse_user:       cassandra     # OS user that owns keystores and cassandra.yaml
+  use_sudo:       true          # sudo -u cassandra (NOPASSWD required — see above)
+  ssl_dir:        /etc/dse/ssl
   cassandra_yaml: /etc/dse/cassandra/cassandra.yaml
 
 nodes:
@@ -158,77 +105,79 @@ nodes:
   - host: 10.1.1.3
     name: node3
     dc:   dc2
+
+# Optional — only needed if you want OpsCenter SSL checks
+opscenter:
+  host:     10.1.1.10
+  ssh_user: ubuntu
+  ssh_key:  ~/.ssh/id_rsa
+  conf:     /etc/opscenter/opscenterd.conf
 ```
 
-**2. Run:**
-
-```bash
-python validator.py -i inventory.yml
-```
-
-**3. Read the output:**
-
-```
-DSE SSL Validator  │  cluster=MyCluster  │  nodes=3  │  check-mode=all
-────────────────────────────────────────────────────────────────────
-
-  [FAIL]  node2             cert_expiry
-                            Certificate expires in 5 days (2025-01-20).
-                            → Renew certificate, import into keystore, restart DSE.
-
-  [FAIL]  node1             privkey_alias
-                            Configured alias 'cassandra' not found in keystore.
-                            Present aliases: node1-key
-                            → Set server_encryption_options.alias: node1-key in cassandra.yaml
-
-  [WARN]  node3             restart_required
-                            keystore modified 2025-01-14 09:12 UTC but DSE started
-                            2025-01-10 06:00 UTC — reload required.
-                            → Perform a rolling restart of DSE.
-
-────────────────────────────────────────────────────────────────────
-  DSE SSL Validator  │  Overall: FAIL  │  Score: 84%
-  ████████████████████████████████░░░░░░░░  84%
-  PASS:42  WARN:3  FAIL:2  INFO:10  SKIP:0
-────────────────────────────────────────────────────────────────────
-
-  JSON → reports/report_20250115T142300.json
-```
+Per-node overrides are supported — any field under `defaults` can be overridden on an individual node entry.
 
 ---
 
-## Usage
+## Check modes
+
+Use `--check-mode` to target one SSL layer at a time. Omit it to run all 19 modules.
+
+| Mode | What is validated | Port(s) | Typical use |
+|------|-------------------|---------|-------------|
+| `internode` | Node-to-node SSL: config, cert, chain, trust, tls mesh, match, hostname, jmx, ciphers, versions, restart, logs, privkey, alias, perms, integrity, revocation | 7000 / 7001 | Gossip / internode TLS failures |
+| `client` | Client CQL SSL: config, cert, chain, trust, native, hostname, ciphers, versions, privkey, alias, perms, integrity | 9042 / 9142 | CQLSH / driver connection failures |
+| `opscenter` | OpsCenter ↔ agent SSL | 61620 / 61621 | OpsCenter agent disconnects |
+| `all` | All 19 modules **(default)** | all | Full cluster SSL audit |
+
+### Internode port selection
+
+The port used for internode SSL depends on DSE/C* version:
+
+| Version | SSL port | Notes |
+|---------|----------|-------|
+| DSE 5.1 / 6.7 / 6.8 | 7001 | Dedicated SSL storage port |
+| DSE 6.9 < 6.9.7 | 7001 | Dedicated SSL storage port |
+| DSE 6.9.7+ | 7000 | SSL multiplexed on the main port |
+| C* 4.0+ | 7000 | `enable_legacy_ssl_storage_port: false` |
+
+> Setting `enable_legacy_ssl_storage_port: false` in `cassandra.yaml` forces SSL onto port 7000 regardless of version.
+
+---
+
+## Usage examples
 
 ```bash
-# Full cluster validation (all 19 modules)
-python validator.py -i inventory.yml
+# Full cluster audit — all 19 modules
+python3 validator.py -i inventory.yml
 
 # Node-to-node SSL only
-python validator.py -i inventory.yml --check-mode internode
+python3 validator.py -i inventory.yml --check-mode internode
 
 # Client CQL SSL only
-python validator.py -i inventory.yml --check-mode client
+python3 validator.py -i inventory.yml --check-mode client
 
 # OpsCenter SSL only
-python validator.py -i inventory.yml --check-mode opscenter
+python3 validator.py -i inventory.yml --check-mode opscenter
 
-# Specific modules only (-m overrides --check-mode)
-python validator.py -i inventory.yml -m cert,trust,tls
+# Run on specific nodes only
+python3 validator.py -i inventory.yml --nodes node1,node2
 
-# Security audit modules only
-python validator.py -i inventory.yml -m privkey,alias,perms,integrity,revocation
-
-# Single node with debug output
-python validator.py -i inventory.yml --nodes node1 --log-level DEBUG
+# Run specific modules (overrides --check-mode)
+python3 validator.py -i inventory.yml -m cert,trust,tls
+python3 validator.py -i inventory.yml -m privkey,alias,perms,integrity,revocation
 
 # Adjust cert expiry thresholds
-python validator.py -i inventory.yml --warn-days 60 --fail-days 14
+python3 validator.py -i inventory.yml --warn-days 60 --fail-days 14
 
-# CI/CD pipeline — exit 0=PASS  1=WARN  2=FAIL
-python validator.py -i inventory.yml -o reports/ ; echo "Exit: $?"
+# Debug a single node
+python3 validator.py -i inventory.yml --nodes node1 --log-level DEBUG
 
-# No colour (for log files / CI)
-python validator.py -i inventory.yml --no-colour
+# Run directly on a DSE node without SSH
+python3 validator.py --local --check-mode internode
+
+# CI/CD pipeline
+python3 validator.py -i inventory.yml --no-colour -o reports/
+echo "Exit: $?"   # 0=PASS  1=WARN  2=FAIL
 ```
 
 ---
@@ -237,97 +186,89 @@ python validator.py -i inventory.yml --no-colour
 
 ```
 Mode (pick one):
-  -i, --inventory FILE    inventory.yml path (SSH cluster mode)
-  --local                 run all checks locally on THIS host — no SSH needed
+  -i, --inventory FILE      Path to inventory.yml  (SSH cluster mode)
+      --local               Run all checks on THIS host — no SSH or inventory needed
 
 Output:
-  -o, --output     DIR    report output directory             (default: reports/)
-  --check-mode     MODE   internode | client | opscenter | all  (default: all)
-  -m, --modules    LIST   comma-separated modules — overrides --check-mode
-  --nodes          LIST   restrict run to named nodes (SSH mode only)
+  -o, --output     DIR      Report output directory          (default: reports/)
+      --check-mode MODE     internode | client | opscenter | all  (default: all)
+  -m, --modules    LIST     Comma-separated modules — overrides --check-mode
+      --nodes      LIST     Restrict to named nodes, comma-separated  (SSH mode)
 
 Thresholds:
-      --warn-days  INT    cert expiry warning threshold       (default: 30 days)
-      --fail-days  INT    cert expiry failure threshold       (default:  7 days)
-      --timeout    INT    SSH / openssl timeout seconds       (default: 10)
-      --threads    INT    parallel workers (node + stage)     (default:  8)
+      --warn-days  INT      Cert expiry warning threshold    (default: 30 days)
+      --fail-days  INT      Cert expiry failure threshold    (default:  7 days)
+      --timeout    INT      SSH / openssl timeout in seconds (default: 10)
+      --threads    INT      Parallel workers — node + stage  (default:  8)
 
 Local mode / OpsCenter:
-      --cassandra-yaml PATH   cassandra.yaml for --local mode
-                              (default: /etc/dse/cassandra/cassandra.yaml)
-      --opscenter-host HOST   OpsCenter IP — overrides inventory opscenter block
-      --opscenter-conf PATH   opscenterd.conf path for --opscenter-host
-                              (default: /etc/opscenter/opscenterd.conf)
+      --cassandra-yaml PATH cassandra.yaml path for --local mode
+                            (default: /etc/dse/cassandra/cassandra.yaml)
+      --opscenter-host HOST OpsCenter IP — overrides inventory opscenter block
+      --opscenter-conf PATH opscenterd.conf path  (default: /etc/opscenter/opscenterd.conf)
 
 Display:
-      --no-colour         disable ANSI colours
-      --log-level LEVEL   DEBUG | INFO | WARNING             (default: WARNING)
+      --no-colour           Disable ANSI colour output
+      --log-level LEVEL     DEBUG | INFO | WARNING  (default: WARNING)
 ```
 
 ---
 
-## Local mode — run directly on a DSE node
+## Local mode
 
-When you are **logged in to a DSE node** you can run all checks without any SSH or inventory file.  
-All 19 modules work identically — `ssh_run()` routes commands through `bash -c` on localhost.
+When you are logged in directly to a DSE node, run all checks without any SSH or inventory file.
 
 ```bash
 # Full check on this node
-python validator.py --local
+python3 validator.py --local
 
-# Quick key/store/permissions audit only
-python validator.py --local -m privkey,alias,perms,integrity
+# Internode SSL only
+python3 validator.py --local --check-mode internode
 
-# Non-default cassandra.yaml location
-python validator.py --local \
+# Quick key/store/permissions audit
+python3 validator.py --local -m privkey,alias,perms,integrity
+
+# Non-standard cassandra.yaml path
+python3 validator.py --local \
   --cassandra-yaml /opt/dse/resources/cassandra/conf/cassandra.yaml
 
-# Validate OpsCenter from a DSE node (SSH's to the OpsCenter host)
-python validator.py --local --opscenter-host 10.1.1.10
-
-# Override opscenterd.conf path
-python validator.py --local \
-  --opscenter-host 10.1.1.10 \
-  --opscenter-conf /etc/opscenter/opscenterd.conf
+# Validate OpsCenter SSL from this node
+python3 validator.py --local --opscenter-host 10.1.1.10
 ```
 
-**How it works:**  
-- Reads `cassandra.yaml` from disk directly.  
-- Detects DSE version with `dse -v` and Java version with `java -version`.  
-- Every `keytool` / `openssl` / `stat` / `ss` command runs as the current user.  
-- If OpsCenter validation is needed, it SSH's from this node to `--opscenter-host`.
+In local mode:
+- `cassandra.yaml` is read directly from disk
+- DSE version is detected with `dse -v`, Java version with `java -version`
+- All `keytool` / `openssl` / `stat` commands run as the current user
+- OpsCenter checks SSH from this node to `--opscenter-host`
 
 ---
 
 ## Node discovery — gen-inventory.py
 
-If some nodes have **broken SSL/JMX** (the common scenario when you need this tool), `nodetool` may be unusable for discovery. `gen-inventory.py` uses **four SSL-independent strategies** to discover every cluster node and write a ready-to-use `inventory.yml`.
+When SSL or JMX is broken, `nodetool` cannot list the ring. `gen-inventory.py` uses four SSL-independent strategies to discover all cluster nodes and write a ready-to-use `inventory.yml`.
 
-### The problem
+### Discovery strategies
 
-`nodetool` connects via JMX port 7199. When `com.sun.management.jmxremote.ssl=true` and the TLS config is broken, JMX handshake fails and `nodetool` returns nothing — you can't list the ring.
-
-### Four discovery strategies (merged, each bypasses SSL)
-
-| # | Strategy | Transport | Works when |
-|---|----------|-----------|------------|
-| 1 | **`system.peers` CQL query** | Plaintext port 9042 | SSL broken on JMX; CQL still accepting plaintext |
-| 2 | **`nodetool -h 127.0.0.1` via SSH** | Localhost JMX (no TLS on loopback by default) | Remote JMX SSL broken; local JMX up |
-| 3 | **`system.log` gossip scan** | SSH + grep | Everything else broken; node ever started |
-| 4 | **`cassandra.yaml` seeds + `--seeds` arg** | Static config | Always — absolute fallback |
+| # | Strategy | How it works | Works when |
+|---|----------|-------------|------------|
+| 1 | `system.peers` CQL query | Queries plaintext port 9042 | JMX broken, CQL still plaintext |
+| 2 | `nodetool -h 127.0.0.1` via SSH | Runs nodetool over localhost loopback | Remote JMX SSL broken, loopback JMX up |
+| 3 | `system.log` gossip scan | SSH + grep for peer IPs in logs | Everything broken, node has ever started |
+| 4 | `cassandra.yaml` seeds | Reads seeds from config | Always — absolute fallback |
 
 ### Usage
 
 ```bash
-# Minimal — at least one known seed required
-python gen-inventory.py \
+# Minimal
+python3 gen-inventory.py \
   --seeds 10.1.1.1,10.1.1.2 \
   --ssh-user ubuntu \
   --ssh-key ~/.ssh/id_rsa \
   --dse-user cassandra
 
-# With subnet filter to reduce gossip-log false positives
-python gen-inventory.py \
+# With subnet filter and output file
+python3 gen-inventory.py \
   --seeds 10.1.1.1 \
   --ssh-user ubuntu \
   --ssh-key ~/.ssh/id_rsa \
@@ -336,50 +277,42 @@ python gen-inventory.py \
   --cluster-name MyCluster \
   --out inventory.yml
 
-# Then run the validator on all discovered nodes
-python validator.py -i inventory.yml
+# Then validate
+python3 validator.py -i inventory.yml
 ```
 
 ### gen-inventory.py options
 
 ```
---seeds       IP[,IP...]   Known node IPs to bootstrap from (required)
---ssh-user    USER         SSH login user       (default: ubuntu)
---ssh-key     FILE         SSH private key path
---ssh-port    PORT         SSH port             (default: 22)
---dse-user    USER         OS user owning DSE config/keystores (default: cassandra)
---cassandra-yaml PATH      Remote cassandra.yaml path
---ssl-dir     PATH         Remote SSL dir
---cluster-name NAME        Written into the output inventory
---cql-port    PORT         Plaintext CQL port for strategy 1 (default: 9042)
---cqlsh       PATH         cqlsh binary path    (default: cqlsh)
---subnet-hint PREFIX       IP prefix filter for gossip-log results, e.g. '10.1.1.'
---out         FILE         Output inventory YAML (default: inventory.yml)
---log-level   LEVEL        DEBUG | INFO | WARNING
+--seeds         IP[,IP...]  Known node IPs to bootstrap from (required)
+--ssh-user      USER        SSH login user           (default: ubuntu)
+--ssh-key       FILE        SSH private key path
+--ssh-port      PORT        SSH port                 (default: 22)
+--dse-user      USER        OS user owning DSE config/keystores  (default: cassandra)
+--cassandra-yaml PATH       Remote cassandra.yaml path
+--ssl-dir       PATH        Remote SSL directory
+--cluster-name  NAME        Written into the output inventory
+--cql-port      PORT        Plaintext CQL port       (default: 9042)
+--cqlsh         PATH        cqlsh binary path        (default: cqlsh)
+--subnet-hint   PREFIX      IP prefix filter, e.g. '10.1.1.'
+--out           FILE        Output file              (default: inventory.yml)
+--log-level     LEVEL       DEBUG | INFO | WARNING
 ```
 
 ---
 
-## Split-user support (SSH user ≠ DSE user)
+## Split-user support
 
-Many production environments use a dedicated OS account (`cassandra` or `dse`) that owns all keystore/config files, but SSH logins use a different account (`ubuntu`, `ec2-user`, `automaton`).
+Many production environments SSH as one user (`ubuntu`, `automaton`, `ec2-user`) while DSE is owned by a different OS user (`cassandra`, `dse`). Set both in `inventory.yml`:
 
 ```yaml
 defaults:
-  ssh_user:  ubuntu       # SSH login account
-  dse_user:  cassandra    # owns /etc/dse/ssl/*.jks and cassandra.yaml
-  use_sudo:  true         # uses: sudo -u cassandra -n <command>
+  ssh_user:  ubuntu      # SSH login account
+  dse_user:  cassandra   # owns /etc/dse/ssl/*.jks and cassandra.yaml
+  use_sudo:  true        # wraps keytool/stat as: sudo -u cassandra -n <cmd>
 ```
 
-Required sudoers rule on each node:
-
-```
-ubuntu ALL=(cassandra) NOPASSWD: ALL
-# or scope to specific binaries:
-ubuntu ALL=(cassandra) NOPASSWD: /usr/bin/keytool, /usr/bin/stat, /bin/cat
-```
-
-When `ssh_user == dse_user` (or `dse_user` is empty), no sudo wrapping is applied.
+When `ssh_user == dse_user` or `dse_user` is empty, no sudo wrapping is applied.
 
 ---
 
@@ -392,109 +325,272 @@ opscenter:
   host:     10.1.1.10
   ssh_user: ubuntu
   ssh_key:  ~/.ssh/id_rsa
-  dse_user: opscenter     # if different from cassandra
   conf:     /etc/opscenter/opscenterd.conf
 ```
 
-### Via CLI (override or standalone)
+### Via CLI
 
 ```bash
-# Override inventory block
-python validator.py -i inventory.yml --opscenter-host 10.1.1.10
-
-# From a DSE node — no inventory needed
-python validator.py --local --opscenter-host 10.1.1.10
-
-# Module-only OpsCenter check
-python validator.py -i inventory.yml -m opscenter
+python3 validator.py -i inventory.yml --opscenter-host 10.1.1.10
+python3 validator.py --local --opscenter-host 10.1.1.10
+python3 validator.py -i inventory.yml -m opscenter
 ```
 
-### What is checked
+### Checks performed
 
-| Check | Detail |
-|-------|--------|
+| Check | What is validated |
+|-------|-------------------|
 | `opscenter_use_ssl` | `[agents] use_ssl = true` in `opscenterd.conf` |
-| `opscenter_keyfile` | `ssl_keyfile` is a PEM private key — **not** a `.jks`/`.p12` (IBM Support KB #7258720) |
+| `opscenter_keyfile` | `ssl_keyfile` is a PEM private key, not a `.jks` or `.p12` file |
 | `agent_http` | Port 61620 reachable from each DSE node |
 | `agent_stomp_ssl` | Port 61621 (STOMP over SSL) reachable from each DSE node |
 
 ---
 
-## New modules in detail (15–19)
+## Module reference
+
+### Stage 1 — `config` — Configuration Validation (GATE)
+
+Reads `cassandra.yaml` and validates SSL settings. A FAIL here stops all further checks for that node.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `internode_encryption` | FAIL | `internode_encryption` missing or `none` |
+| `keystore_path` | FAIL | Keystore or truststore path not configured |
+| `blank_password` | FAIL | Empty keystore or truststore password |
+| `deprecated_protocol` | WARN | `protocol: TLSv1` or `TLSv1.1` configured |
+| `server_optional` | WARN | `optional: true` — plaintext connections allowed |
+| `cipher_suites` | INFO | Cipher suite list (absent = JVM defaults, which is fine) |
+| `legacy_ssl_port` | INFO | `enable_legacy_ssl_storage_port` value and effective SSL port |
+| `config_consistency` | FAIL | Nodes disagree on `internode_encryption`, `protocol`, or `require_client_auth` |
+
+---
+
+### Stage 2 — `cert` — Certificate Validation (GATE)
+
+Inspects the node certificate in the keystore. A FAIL here stops chain and trust checks.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `keystore_access` | FAIL | Keystore file not found or unreadable |
+| `keystore_password` | FAIL | Wrong keystore password |
+| `cert_expiry` | FAIL / WARN | Certificate expires within `--fail-days` (FAIL) or `--warn-days` (WARN) |
+| `cert_not_yet_valid` | FAIL | Certificate `notBefore` is in the future |
+| `cert_sig_alg` | WARN | Weak signature algorithm (MD5, SHA1) |
+| `key_size` | FAIL / WARN | RSA < 2048 = FAIL; RSA < 4096 = WARN; EC < 256 = FAIL |
+
+---
+
+### Stage 3 — `chain` — CA Chain Validation (GATE)
+
+Verifies the certificate chain from leaf to root CA. Handles both self-signed and CA-signed deployments.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `chain_depth` | INFO / WARN | Chain depth reported; WARN only if CA-signed with depth=1 (intermediate missing) |
+| `cert_issuer` | INFO | Subject, Issuer, and self-signed status of the leaf cert |
+| `issuer_in_truststore` | PASS / FAIL | **Self-signed:** SHA-256 fingerprint of leaf cert matched in truststore. **CA-signed:** Issuer DN matched in truststore Owner lines |
+| `truststore_root_ca` | INFO | Root CA entries found in truststore |
+| `truststore_intermediate_ca` | INFO | Intermediate CA entries found in truststore |
+| `truststore_no_root` | FAIL | No root CA in truststore (CA-signed deployments only) |
+| `ca_cert_expiry` | FAIL / WARN | A CA certificate in the truststore is expiring |
+| `chain_verify` | PASS / FAIL / INFO | `openssl verify` result; INFO for self-signed (fingerprint check is authoritative) |
+
+> **Self-signed deployments:** When Subject DN == Issuer DN, the validator uses SHA-256 fingerprint comparison to verify trust instead of CA DN lookup. This correctly handles environments where the same certificate is imported into both keystore and truststore.
+
+---
+
+### Stage 4 — `trust` — Truststore Validation (GATE)
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `truststore_access` | FAIL | Truststore file not found or unreadable |
+| `truststore_password` | FAIL | Wrong truststore password |
+| `truststore_empty` | FAIL | No `trustedCertEntry` entries in truststore |
+| `truststore_single_ca` | WARN | Only 1 CA entry — both old and new CAs must be present during CA rotation |
+
+---
+
+### Stage 5 — `tls` — TLS Mesh Connectivity
+
+Runs a full N×(N-1) `openssl s_client` mesh — every source node connects to every other node.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `tls_<src>→<tgt>` | PASS / FAIL | TLS handshake result, negotiated protocol, cipher suite, verify return code |
+| `tcp_<src>→<tgt>` | FAIL | TCP port unreachable before TLS attempt |
+
+---
+
+### Stage 6 — `match` — Live Certificate Match
+
+Compares the SHA-256 fingerprint of the certificate in the keystore against the certificate currently being served over TLS. A mismatch means the node was not restarted after a cert rotation.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `cert_match` | PASS / FAIL | Keystore fingerprint matches live TLS fingerprint |
+| `cert_match_no_tls` | INFO | TLS not reachable — live comparison skipped |
+
+---
+
+### Stage 7 — `hostname` — SAN / CN Validation
+
+Checks whether the node's IP addresses and hostname are present in the certificate SAN.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `cert_identities` | INFO | CN, DNS SANs, and IP SANs extracted from the certificate |
+| `san_mismatch` | FAIL / WARN | Address not in SAN/CN. FAIL when `require_endpoint_verification: true`; WARN otherwise. IPs must appear as IP SAN entries (not in CN) per RFC 6125 |
+
+---
+
+### Stage 8 — `jmx` — JMX SSL
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `jmx_ssl_flag` | PASS / INFO | `jmxremote.ssl` in JVM process args (INFO when absent — advisory only) |
+| `jmx_port` | WARN | Port 7199 not listening |
+| `jmx_tls` | PASS / WARN | TLS handshake result on port 7199 |
+
+---
+
+### Stage 9 — `native` — Client SSL Ports
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `port_9042` | PASS / WARN | CQL port 9042 listening status |
+| `native_tls_9042` | PASS / WARN | TLS handshake on port 9042 |
+| `native_tls_9142` | PASS / WARN | TLS handshake on port 9142 (dedicated SSL port) |
+
+---
+
+### Stage 10 — `opscenter` — OpsCenter SSL
+
+See [OpsCenter validation](#opscenter-validation) above.
+
+---
+
+### Stage 11 — `ciphers` — Cipher Suite Audit
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `broken_cipher_config` | FAIL | RC4, DES, 3DES, EXPORT, NULL, or anon ciphers in `cassandra.yaml` |
+| `broken_cipher_live` | FAIL | Broken cipher negotiated in live TLS handshake |
+| `cipher_suites` | INFO | Configured cipher list (absent = JVM defaults, which is acceptable) |
+
+---
+
+### Stage 12 — `versions` — Java / TLS Version Matrix
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `java_version` | INFO | Java version detected |
+| `tls_protocol` | WARN | TLSv1.0 or TLSv1.1 negotiated |
+| `java_8_old` | WARN | Java 8 below u261 — TLSv1.3 not supported |
+| `dse69_java17` | WARN | DSE 6.9 recommends Java 17; JKS format deprecated |
+
+---
+
+### Stage 13 — `restart` — Pending Restart Detection
+
+Compares keystore/truststore file modification time against the DSE process start time. A mismatch means a cert rotation was applied but DSE was not restarted.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `restart_required` | WARN | Keystore or truststore modified after DSE process start |
+
+---
+
+### Stage 14 — `logs` — Log Error Scan
+
+Scans `system.log` for SSL error patterns and checks system clock synchronisation.
+
+| Check | Severity | What it catches |
+|-------|----------|----------------|
+| `ssl_log_errors` | WARN | `SSLHandshakeException`, `PKIX path building failed`, `unable to find valid certification path`, `CertificateExpiredException` |
+| `clock_skew` | WARN | `timedatectl` reports clock not synchronised |
+| `ssl_port_open` | INFO | Runtime port status for internode SSL port |
+
+---
 
 ### Stage 15 — `privkey` — Private Key Validation
 
-The most common cause of `UnrecoverableKeyException` and TLS handshake failures at DSE startup.
+The most common source of `UnrecoverableKeyException` and TLS handshake failures at DSE startup.
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
-| `privkey_entry` | FAIL | Keystore has no `PrivateKeyEntry` — only `trustedCertEntry` |
-| `privkey_alias` | FAIL | Auto-discovered or configured alias not in keystore — lists all available aliases |
-| `privkey_algorithm` | INFO | Reports RSA or EC algorithm detected from `keytool -v` output |
-| `privkey_alg_unsupported` | WARN | Algorithm cannot be determined from keytool output |
-| `privkey_size` | FAIL/WARN | RSA < 2048 bits = FAIL; RSA < 4096 = WARN; EC < 256 = FAIL |
-| `privkey_cert_match` | FAIL | Certificate exported under alias is unreadable — key/cert pair is mismatched or corrupt |
+| `privkey_entry` | FAIL | Keystore has no `PrivateKeyEntry` — only `trustedCertEntry` entries |
+| `privkey_alias` | FAIL | Configured or auto-discovered alias not found in keystore |
+| `privkey_algorithm` | INFO | Key algorithm reported (RSA, EC) |
+| `privkey_alg_unsupported` | WARN | Algorithm unreadable from `keytool -v` output |
+| `privkey_size` | FAIL / WARN | RSA < 2048 = FAIL; RSA < 4096 = WARN; EC < 256 = FAIL |
+| `privkey_cert_match` | PASS / FAIL | Certificate exported from private key alias is readable — key/cert pair intact |
 
-> **Alias auto-discovery:** The tool automatically finds the first `PrivateKeyEntry` alias in the keystore. No need to set `server_encryption_options.alias` unless you have multiple keys and want to pin a specific one. This handles environments where the alias is `dse-node`, `mykey`, etc.
+> **Alias auto-discovery:** The alias is automatically found from the first `PrivateKeyEntry` in the keystore. You do not need to set `server_encryption_options.alias` unless the keystore has multiple private keys.
+
+---
 
 ### Stage 16 — `alias` — Alias Inventory
 
-```
-keytool -list -v -keystore server-keystore.jks
-```
+Full alias audit of the keystore and truststore.
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
-| `alias_inventory` | INFO | Lists all PKE + TCE aliases discovered in the keystore |
-| `alias_no_pke` | FAIL | Zero `PrivateKeyEntry` aliases |
-| `alias_multiple_pke` | WARN | > 1 PKE — tool uses first one; set `alias:` in cassandra.yaml to pin |
-| `alias_pke_count` | PASS | Exactly one `PrivateKeyEntry` found |
-| `alias_configured_ok` | PASS | Auto-discovered alias is a `PrivateKeyEntry` |
-| `alias_type_mismatch` | FAIL | `alias:` in cassandra.yaml points to a `trustedCertEntry`, not a private key |
-| `alias_chain_missing` | FAIL | Chain length = 0 — no certificate attached to the private key |
-| `alias_chain_incomplete` | WARN | Chain length = 1 — intermediate CA missing |
-| `truststore_dup_certs` | WARN | Same SHA1 fingerprint under two different aliases |
+| `alias_inventory` | INFO | All `PrivateKeyEntry` and `trustedCertEntry` aliases listed |
+| `alias_no_pke` | FAIL | No `PrivateKeyEntry` found in keystore |
+| `alias_multiple_pke` | WARN | More than one `PrivateKeyEntry` — tool uses the first one |
+| `alias_pke_count` | PASS | Exactly one `PrivateKeyEntry` |
+| `alias_configured_ok` | PASS | Configured alias is a `PrivateKeyEntry` |
+| `alias_type_mismatch` | FAIL | Configured alias points to a `trustedCertEntry`, not a private key |
+| `alias_chain_missing` | FAIL | `PrivateKeyEntry` has no certificate chain attached (chain length = 0) |
+| `alias_chain_incomplete` | WARN | Chain length = 1 (leaf only, intermediate CA missing) |
+| `truststore_dup_certs` | WARN | Same SHA-1 fingerprint found under different aliases in truststore |
+
+---
 
 ### Stage 17 — `perms` — File Permissions
 
-Checked on: keystore, truststore, `cassandra.yaml`
+Checks keystore and truststore ownership and permissions. `cassandra.yaml` is excluded (it is world-readable by design).
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
-| `perms_<file>_owner` | WARN | File owner AND group are both different from `dse_user` |
+| `perms_<file>_owner` | WARN | File owner and group are both different from `dse_user` |
 | `perms_<file>_mode` | FAIL | World-readable or world-writable (`o+r` or `o+w`) |
-| `perms_<file>_mode` | WARN | Group-writable (`g+w`) or execute bits set |
+| `perms_<file>_mode` | WARN | Group-writable (`g+w`) or execute bit set |
 | `selinux_<file>` | WARN | `unlabeled_t` or `default_t` SELinux context — `restorecon` required |
 
-Correct state: `chown cassandra:cassandra <file> && chmod 600 <file>`
+Correct state: `chown cassandra:cassandra keystore.jks && chmod 600 keystore.jks`
 
-> **Ownership logic:** Ownership passes if `owner == dse_user` **or** `group == dse_user`. So `-rw------- cassandra:cassandra` with `dse_user: cassandra` is always PASS, even when SSH runs as `automaton`.
+Ownership passes when `owner == dse_user` **or** `group == dse_user`, so files owned `cassandra:cassandra` are always PASS even when SSH runs as `automaton`.
+
+---
 
 ### Stage 18 — `integrity` — Store Integrity
 
-Runs `keytool -list -v` on both keystore and truststore and audits every attribute.
+Full integrity audit of keystore and truststore using `keytool -list -v`.
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
 | `integrity_<store>_readable` | FAIL | File missing or unreadable by `dse_user` |
 | `integrity_<store>_password` | FAIL | Wrong password or tampered bytes |
-| `integrity_<store>_type` | WARN | JKS format (legacy) — recommends PKCS12 migration |
-| `integrity_<store>_entries` | INFO | Entry count breakdown (PKE / TCE / SecretKey) |
+| `integrity_<store>_type` | WARN | JKS format (legacy) — PKCS12 migration recommended |
+| `integrity_<store>_entries` | INFO | Entry count breakdown (PrivateKeyEntry / trustedCertEntry / SecretKey) |
 | `integrity_keystore_empty_pke` | FAIL | Keystore has no `PrivateKeyEntry` |
 | `integrity_truststore_empty_tce` | FAIL | Truststore has no `trustedCertEntry` |
 | `integrity_<store>_dup_certs` | WARN | Duplicate SHA-256 fingerprints under different aliases |
 
-### Stage 19 — `revocation` — CRL / OCSP
+---
 
-Requires the DSE node to reach the CA's OCSP responder or CRL distribution point.  
-Results are `WARN` (not `FAIL`) when the endpoint is unreachable — advisory layer only.
+### Stage 19 — `revocation` — Certificate Revocation
+
+Checks OCSP and CRL revocation status. Results are `WARN` (not `FAIL`) when the endpoint is unreachable — the check is advisory.
 
 | Check | Severity | What it catches |
 |-------|----------|----------------|
 | `revocation_ocsp_uri` | INFO | OCSP URL found in AIA extension |
-| `revocation_ocsp` | PASS/FAIL/WARN | Certificate is good / revoked / OCSP unreachable |
+| `revocation_ocsp` | PASS / FAIL / WARN | Certificate is good / revoked / OCSP unreachable |
 | `revocation_crl_uri` | INFO | CRL Distribution Point URL found |
-| `revocation_crl` | PASS/FAIL/WARN | Serial number not in CRL / serial in CRL (REVOKED) / CRL download failed |
+| `revocation_crl` | PASS / FAIL / WARN | Serial not in CRL / serial in CRL (REVOKED) / CRL download failed |
 
 ---
 
@@ -502,33 +598,59 @@ Results are `WARN` (not `FAIL`) when the endpoint is unreachable — advisory la
 
 ### Console
 
-Coloured `FAIL`/`WARN` summary with actionable fix commands, printed immediately as each gate fails.
+Findings are grouped by check type. The same issue on multiple nodes appears as a single entry:
+
+```
+DSE SSL Validator  │  cluster=MyCluster  │  nodes=3  │  check-mode=internode
+────────────────────────────────────────────────────────────────
+
+  [WARN]  (3 nodes)  node1, node2, node3            alias_chain_incomplete
+                                                     Alias 'dse-node' chain length=1 (leaf only).
+                                                     → Re-import with full chain (leaf + intermediate + root).
+
+  [WARN]  (3 nodes)  node1, node2, node3            san_mismatch
+                                                     [node1] listen_address=10.166.64.57 not present in cert SAN/CN.
+                                                     [node2] listen_address=10.166.67.15 not present in cert SAN/CN.
+                                                     [node3] listen_address=10.166.68.212 not present in cert SAN/CN.
+                                                     → Add the IP/hostname to the certificate SAN.
+
+────────────────────────────────────────────────────────────────
+  DSE SSL Validator  │  Overall: WARN  │  Score: 70%
+  ████████████████████████████░░░░░░░░░░░░  70%
+  PASS:60  WARN:8  FAIL:0  INFO:56  SKIP:3
+────────────────────────────────────────────────────────────────
+
+  JSON → reports/report_20260807T132955.json
+```
+
+- `FAIL` findings are printed in red, `WARN` in yellow, `PASS` in green
+- Gate FAILs are printed immediately when they occur (before the final summary)
+- Use `--no-colour` for plain text output suitable for log files or CI
 
 ### JSON report
 
-`reports/report_<run_id>.json` — structured, CI/CD-friendly:
+`reports/report_<run_id>.json` — one file per run, structured for CI/CD or ticket attachment:
 
 ```json
 {
-  "run_id": "20250115T142300",
+  "run_id": "20260807T132955",
   "cluster_name": "MyCluster",
-  "dse_version": "6.8.43",
+  "dse_version": "6.9.4",
   "nodes_checked": 3,
-  "overall_status": "FAIL",
-  "score": 84,
-  "summary": { "PASS": 42, "WARN": 3, "FAIL": 2, "INFO": 10, "SKIP": 0 },
-  "generated_at": "2025-01-15T14:23:00Z",
+  "overall_status": "WARN",
+  "score": 70,
+  "summary": { "PASS": 60, "WARN": 8, "FAIL": 0, "INFO": 56, "SKIP": 3 },
+  "generated_at": "2026-08-07T13:29:55Z",
   "recommendations": [
-    "[node2] Certificate expires in 5 days  →  Renew certificate, import into keystore, restart DSE.",
-    "[node1] Configured alias 'cassandra' not found  →  Set server_encryption_options.alias"
+    "[node1] Alias 'dse-node' chain length=1  →  Re-import with full chain."
   ],
   "findings": [
     {
-      "node":   "node2",
-      "check":  "cert_expiry",
-      "status": "FAIL",
-      "detail": "Certificate expires in 5 days (2025-01-20).",
-      "fix":    "Renew the certificate, import into keystore, restart DSE."
+      "node":   "node1",
+      "check":  "alias_chain_incomplete",
+      "status": "WARN",
+      "detail": "Alias 'dse-node' chain length=1 (leaf only).",
+      "fix":    "Re-import with full chain (leaf + intermediate + root)."
     }
   ]
 }
@@ -536,21 +658,36 @@ Coloured `FAIL`/`WARN` summary with actionable fix commands, printed immediately
 
 ---
 
-## Target node requirements
+## Validation order (gate-based)
 
-Standard on any DSE host — **no installation needed on the target nodes**:
+Stages 1–4 run sequentially. A FAIL in any gate stops further checks for that node immediately, preventing false positives from cascading failures. Stages 5–19 run in parallel once all gates pass.
 
-| Tool | Used for |
-|------|----------|
-| `openssl` | TLS handshake mesh, cert verification, OCSP/CRL, fingerprint comparison |
-| `keytool` | Keystore/truststore inspection, cert export |
-| `ss` / `netstat` | Port listening status |
-| `nc` | TCP reachability checks |
-| `stat` | File mtime (restart detection), permissions |
-| `grep` / `ps` | Log scanning, process detection |
-| `curl` / `wget` | CRL download (Stage 19 only) |
-| `timedatectl` | Clock skew detection |
-| `selinuxenabled` / `ls -Z` | SELinux context (Stage 17, optional) |
+```
+Stage  1  config     ── GATE  cassandra.yaml paths, passwords, protocol
+Stage  2  cert       ── GATE  certificate valid, not expired, key size OK
+Stage  3  chain      ── GATE  CA chain verifies against truststore
+Stage  4  trust      ── GATE  truststore accessible and populated
+─────────────────────────────────────────────────────────────────────────
+Stage  5  tls              N×(N-1) openssl s_client mesh (all node pairs)
+Stage  6  match            keystore fingerprint vs live TLS cert
+Stage  7  hostname         SAN/CN vs listen_address, broadcast_address, hostname
+Stage  8  jmx              port 7199 TLS handshake
+Stage  9  native           ports 9042 / 9142 TLS handshake
+Stage 10  opscenter        opscenterd.conf + agent ports 61620 / 61621
+Stage 11  ciphers          broken cipher audit (config + live)
+Stage 12  versions         Java / TLS version matrix
+Stage 13  restart          keystore mtime vs DSE process start time
+Stage 14  logs             system.log SSL error patterns + clock skew
+Stage 15  privkey          private key existence, algorithm, size, cert match
+Stage 16  alias            alias inventory, chain length, duplicates
+Stage 17  perms            file owner, mode, SELinux context
+Stage 18  integrity        store format, entry counts, SHA-256 duplicates
+Stage 19  revocation       OCSP + CRL revocation check
+```
+
+Cluster-level checks run after all nodes complete:
+- **Config consistency** — all nodes must agree on `internode_encryption`, `protocol`, `require_client_auth`, and cipher suites
+- **TLS mesh** — every `(src → tgt)` pair tested in parallel
 
 ---
 
@@ -562,49 +699,14 @@ Standard on any DSE host — **no installation needed on the target nodes**:
 | `1` | At least one WARN, no FAILs |
 | `2` | At least one FAIL |
 
-Suitable for CI/CD pipelines:
-
 ```bash
-python validator.py -i inventory.yml --no-colour -o reports/
+python3 validator.py -i inventory.yml --no-colour -o reports/
 case $? in
   0) echo "SSL health: PASS" ;;
   1) echo "SSL health: WARN — review report" ;;
   2) echo "SSL health: FAIL — block deployment" ; exit 1 ;;
 esac
 ```
-
----
-
-## Validation order (gate-based)
-
-The first FAIL in a gated stage stops further checks for that node and prints remediation immediately. This prevents cascading false-positives.
-
-```
-Stage  1  config     ─── GATE: cassandra.yaml paths/passwords/protocol
-Stage  2  cert       ─── GATE: cert must be valid before chain checks
-Stage  3  chain      ─── GATE: CA chain must verify before trust checks
-Stage  4  trust      ─── GATE: truststore must be sane before TLS tests
-───────────────────────────────────────────────────────────────────────
-Stage  5  tls             N×(N-1) openssl s_client mesh
-Stage  6  match           keystore fingerprint vs live cert
-Stage  7  hostname        SAN/CN vs listen_address/hostname
-Stage  8  jmx             port 7199 TLS
-Stage  9  native          ports 9042/9142 TLS
-Stage 10  opscenter       opscenterd.conf + agent ports
-Stage 11  ciphers         weak/broken cipher audit
-Stage 12  versions        Java/TLS version matrix
-Stage 13  restart         keystore mtime vs process start
-Stage 14  logs            system.log SSL error patterns
-Stage 15  privkey    ⭐   private key existence, algorithm, size, cert↔key match
-Stage 16  alias      ⭐   alias inventory, chain length, duplicates
-Stage 17  perms      ⭐   file owner, mode, SELinux context
-Stage 18  integrity  ⭐   store format, entry counts, SHA-256 duplicates
-Stage 19  revocation ⭐   OCSP + CRL revocation check
-```
-
-Cluster-level checks run after all per-node checks:
-- **config consistency** — all nodes must agree on `internode_encryption`, `protocol`, `require_client_auth`, cipher suites
-- **TLS mesh** — every `(src → tgt)` pair tested in parallel
 
 ---
 
