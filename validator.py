@@ -2466,6 +2466,41 @@ def _has_fail(findings: List[Finding]) -> bool:
 # Report
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _group_findings(actionable: List["Finding"]):
+    """
+    Group actionable findings by (status, check, fix) so that the same issue
+    appearing on multiple nodes is shown as a single entry.
+
+    Returns a list of dicts:
+      {
+        "status":      str,
+        "check":       str,
+        "fix":         str,
+        "unique_nodes": [str, ...],  # deduplicated node names, insertion order
+        "rows":        [(node, detail), ...],  # one per finding, for per-node detail
+      }
+    """
+    from collections import OrderedDict
+    groups: "OrderedDict[tuple, dict]" = OrderedDict()
+
+    for f in actionable:
+        key = (f.status, f.check, f.fix)
+        if key not in groups:
+            groups[key] = {
+                "status":       f.status,
+                "check":        f.check,
+                "fix":          f.fix,
+                "unique_nodes": [],   # ordered set of node names
+                "rows":         [],   # (node, detail) pairs
+            }
+        g = groups[key]
+        if f.node not in g["unique_nodes"]:
+            g["unique_nodes"].append(f.node)
+        g["rows"].append((f.node, f.detail))
+
+    return list(groups.values())
+
+
 def print_report(findings: List[Finding], no_colour: bool) -> None:
     counts = {s: sum(1 for f in findings if f.status == s)
               for s in ("PASS", "WARN", "FAIL", "INFO", "SKIP")}
@@ -2484,19 +2519,44 @@ def print_report(findings: List[Finding], no_colour: bool) -> None:
 
     actionable = sorted(
         [f for f in findings if f.status in ("FAIL", "WARN")],
-        key=lambda f: (_SEV[f.status], f.node),
+        key=lambda f: (_SEV[f.status], f.check, f.node),
     )
-    if actionable:
-        print()
-        for f in actionable:
-            badge = _colour(f.status, f"[{f.status:<4}]", no_colour)
-            print(f"  {badge}  {f.node:<16}  {f.check}")
-            print(f"           {'':16}  {f.detail}")
-            if f.fix:
-                print(f"           {'':16}  → {f.fix}")
-            print()
-    else:
+
+    if not actionable:
         print(f"\n  {_colour('PASS', '✓ All checks passed!', no_colour)}\n")
+        print(f"{'─'*64}\n")
+        return
+
+    groups = _group_findings(actionable)
+    print()
+
+    for g in groups:
+        badge       = _colour(g["status"], f"[{g['status']:<4}]", no_colour)
+        unique_nodes = g["unique_nodes"]
+        node_count   = len(unique_nodes)
+        nodes_str    = ", ".join(unique_nodes)
+        node_label   = f"({node_count} nodes)  {nodes_str}" if node_count > 1 else nodes_str
+
+        # Header line: badge + affected nodes + check name
+        print(f"  {badge}  {node_label:<40}  {g['check']}")
+
+        # Detail lines:
+        #   - If all rows have the same detail text → print once
+        #   - Otherwise → print one line per row, prefixed with [node]
+        all_details   = [detail for _, detail in g["rows"]]
+        unique_details = list(dict.fromkeys(all_details))  # deduplicate, preserve order
+
+        if len(unique_details) == 1:
+            print(f"           {'':40}  {unique_details[0]}")
+        else:
+            for node_name, detail in g["rows"]:
+                print(f"           {'':40}  [{node_name}] {detail}")
+
+        # Fix printed once — it is the same for every row in the group
+        if g["fix"]:
+            print(f"           {'':40}  → {g['fix']}")
+        print()
+
     print(f"{'─'*64}\n")
 
 
