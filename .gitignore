@@ -5,3 +5,5 @@ reports/
 .pytest_cache/
 *.egg-info/
 .DS_Store
+# Each user keeps their own inventory — never commit customer node details
+inventory.yml
