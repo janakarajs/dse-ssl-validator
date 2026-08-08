@@ -1524,15 +1524,20 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
         dse_user:     opscenter          # OS user that owns opscenterd.conf
         use_sudo:     true               # sudo -u opscenter (NOPASSWD required)
         conf:         /etc/opscenter/opscenterd.conf
-        ssl_dir:      /var/lib/opscenter/ssl   # where opscenter.key etc live
-        cluster_conf: /etc/opscenter/clusters  # directory of cluster .conf files
+        ssl_dir:      /var/lib/opscenter/ssl        # where opscenter.key etc live
+        cluster_conf: /etc/opscenter/clusters       # directory of cluster .conf files
+        agent_yaml:   /var/lib/datastax-agent/conf/address.yaml  # path on DSE nodes
+        agent_ssl_dir: /var/lib/datastax-agent/ssl               # agentKeyStore dir on DSE nodes
     """
     findings: List[Finding] = []
-    conf_path   = ops_cfg.get("conf",         "/etc/opscenter/opscenterd.conf")
-    ssl_dir     = ops_cfg.get("ssl_dir",      "/var/lib/opscenter/ssl")
-    cluster_dir = ops_cfg.get("cluster_conf", "/etc/opscenter/clusters")
-    ssh_user    = ops_cfg.get("ssh_user",     "ubuntu")
-    dse_user    = ops_cfg.get("dse_user",     "opscenter")
+    conf_path    = ops_cfg.get("conf",          "/etc/opscenter/opscenterd.conf")
+    ssl_dir      = ops_cfg.get("ssl_dir",       "/var/lib/opscenter/ssl")
+    cluster_dir  = ops_cfg.get("cluster_conf",  "/etc/opscenter/clusters")
+    agent_yaml_default = ops_cfg.get("agent_yaml",
+                                     "/var/lib/datastax-agent/conf/address.yaml")
+    agent_ssl_dir      = ops_cfg.get("agent_ssl_dir", "/var/lib/datastax-agent/ssl")
+    ssh_user     = ops_cfg.get("ssh_user",      "ubuntu")
+    dse_user     = ops_cfg.get("dse_user",      "opscenter")
     use_sudo    = bool(ops_cfg.get("use_sudo", True))
 
     ops = Node(
@@ -1596,10 +1601,9 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
         # the opposite mismatch: agent has use_ssl:1 but OpsCenter does not.
         # That means the agent will try to connect with SSL but OpsCenter
         # won't respond in kind — the connection will fail silently.
-        agent_yaml_path = "/var/lib/datastax-agent/conf/address.yaml"
         for n in nodes:
             ay_out, _ = ssh_run(n,
-                f"cat {agent_yaml_path} 2>/dev/null", timeout, as_dse=True)
+                f"cat {agent_yaml_default} 2>/dev/null", timeout, as_dse=True)
             if ay_out.strip():
                 ay_ssl = re.search(r"use_ssl\s*:\s*1", ay_out)
                 if ay_ssl:
@@ -1709,17 +1713,37 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
                     ops, val, f"cql_{key}", timeout, must_exist=True))
 
     # ── B. DSE agent nodes — address.yaml + agentKeyStore + port 61621 ────────
-    agent_yaml = "/var/lib/datastax-agent/conf/address.yaml"
-    agent_ks   = "/var/lib/datastax-agent/ssl/agentKeyStore"
+    # agent_yaml path: from inventory opscenter.agent_yaml, or auto-detected
+    # on each node, or the standard default.
+    agent_ks = f"{agent_ssl_dir}/agentKeyStore"
 
     for n in nodes:
-        # B1. address.yaml
+        # B1. address.yaml — try inventory path first, then auto-detect
+        agent_yaml = agent_yaml_default
         ay_out, ay_rc = ssh_run(n,
             f"cat {agent_yaml} 2>/dev/null", timeout, as_dse=True)
+
+        if ay_rc != 0 or not ay_out.strip():
+            # Auto-detect: search common alternative locations
+            detect_out, _ = ssh_run(n,
+                "find /var/lib/datastax-agent /opt/datastax-agent "
+                "/usr/share/datastax-agent "
+                "-name address.yaml 2>/dev/null | head -1",
+                timeout, as_dse=True)
+            alt_path = detect_out.strip()
+            if alt_path and alt_path != agent_yaml:
+                ay_out, ay_rc = ssh_run(n,
+                    f"cat {alt_path} 2>/dev/null", timeout, as_dse=True)
+                if ay_rc == 0 and ay_out.strip():
+                    agent_yaml = alt_path   # use the detected path for this node
+
         if ay_rc != 0 or not ay_out.strip():
             findings.append(Finding(n.name, "agent_address_yaml", "WARN",
-                                    f"address.yaml not readable at {agent_yaml}.",
-                                    "Ensure datastax-agent is installed and address.yaml is configured."))
+                                    f"address.yaml not found at {agent_yaml} "
+                                    f"(also searched /opt/datastax-agent, /usr/share/datastax-agent). "
+                                    "Override path via  agent_yaml:  in inventory opscenter block.",
+                                    "Add to inventory.yml opscenter block:\n"
+                                    "  agent_yaml: /correct/path/to/address.yaml"))
         else:
             findings.append(Finding(n.name, "agent_address_yaml", "PASS",
                                     f"address.yaml found at {agent_yaml}."))
