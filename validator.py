@@ -1,105 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DSE SSL Validator
------------------
-Gate-based SSL/TLS health checker for DSE clusters.
-Covers DSE 5.1, 6.7, 6.8, 6.9 / Apache Cassandra 3.11, 4.0+ / OpsCenter 6.8.
+DSE SSL Validator — gate-based SSL/TLS checker for DSE clusters.
+DSE 5.1 / 6.7 / 6.8 / 6.9  |  C* 3.11 / 4.0+  |  OpsCenter 6.8
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CHECK MODES  (--check-mode)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  internode   Checks node-to-node SSL only:
-                config, cert, chain, trust, tls mesh, match, hostname,
-                ciphers, versions, restart, logs, privkey, alias,
-                perms, integrity, revocation
-              Port used depends on DSE/C* version (see table below).
+Gates (sequential, FAIL stops node): config → cert → chain → trust
+Independent (parallel per node):     tls, match, hostname, jmx, native,
+  ciphers, versions, restart, logs, privkey, alias, perms, integrity, revocation
+Cluster-level (after all nodes):     config consistency, TLS mesh
 
-  client      Checks client application (CQL) SSL only:
-                config (client_encryption_options), cert, chain, trust,
-                native (9042/9142), hostname, ciphers, versions,
-                privkey, alias, perms, integrity
+--check-mode  internode | client | opscenter | all (default)
+-m LIST       override with explicit comma-separated module names
+--threads N   node-level AND stage-level concurrency (default 8)
 
-  opscenter   Checks OpsCenter ↔ agent SSL only:
-                opscenter module (opscenterd.conf, ports 61620/61621)
+Internode port: 7001 for DSE ≤6.9.6 / C* 3.11; 7000 for DSE 6.9.7+ / C* 4.0+
+  (override: enable_legacy_ssl_storage_port in cassandra.yaml)
 
-  all         All of the above  (default)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INTERNODE PORT MATRIX  ⚠ VERSION MATTERS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Version                        | Non-SSL port | SSL port | Notes
-  ─────────────────────────────────────────────────────────────────────────
-  C* 3.11 / DSE 5.1 / DSE 6.8   |    7000      |   7001   | SSL only on 7001
-  DSE 6.9 < 6.9.7                |    7000      |   7001   | same as above
-  C* 4.0+ / DSE 6.9.7+           |    7000      |   7000   | SSL mux on 7000
-  ─────────────────────────────────────────────────────────────────────────
-  enable_legacy_ssl_storage_port: true  → force 7001 (any version)
-  enable_legacy_ssl_storage_port: false → force 7000
-  absent key → auto-detected from version (see above)
-
-  ⚠ Upgrading from DSE 6.8→6.9 (or C* 3.11→4.0) WITH SSL requires the
-    transition flag enable_legacy_ssl_storage_port during rolling upgrade.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-IMPORTANT: PRIVATE KEY SECURITY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  This tool NEVER reads or transmits private keys.
-  All keytool commands use -list or -exportcert (public data only).
-  Keystores are inspected in-place via SSH/sudo — never copied locally.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SPLIT-USER SUPPORT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ssh_user   SSH login account  (e.g. automaton, ubuntu, ec2-user)
-  dse_user   OS account owning keystores/config  (e.g. cassandra, dse)
-  When they differ, every keytool/stat/cat runs via:
-    sudo -u <dse_user> -n <command>
-  Required sudoers:  ssh_user ALL=(dse_user) NOPASSWD: ALL
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VALIDATION STAGES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Gates (sequential — FAIL stops further checks for that node):
-   1. config     cassandra.yaml encryption options, port config, protocol
-   2. cert       keystore accessible, expiry, key size, signature algorithm
-   3. chain      CA chain depth; root + intermediate openssl verify;
-                 Issuer DN cross-checked against truststore entries
-   4. trust      truststore accessible, ≥1 trustedCertEntry; CA rotation warn
-
-  Independent per-node (parallel):
-   5. tls        openssl s_client N×(N-1) mesh on correct internode port;
-                 1-way and 2-way SSL (require_client_auth) handled
-   6. match      keystore fingerprint vs live cert (detect unrestarded node)
-   7. hostname   SAN DNS + IP vs listen_address/broadcast/rpc/hostname;
-                 IP in SAN required when require_endpoint_verification=true
-   8. jmx        port 7199 TLS flag + handshake
-   9. native     ports 9042 / 9142 TLS (client SSL)
-  10. opscenter  opscenterd.conf [agents] ssl_keyfile, ports 61620/61621
-  11. ciphers    broken ciphers (RC4/DES/3DES/EXPORT/NULL/anon) in config
-  12. versions   Java/TLS version matrix
-  13. restart    keystore mtime vs DSE process start
-  14. logs       system.log SSL error scan, clock skew, port status
-  15. privkey    PrivateKeyEntry exists, algorithm, size, cert↔key match
-  16. alias      alias inventory, chain length, duplicate certs
-  17. perms      file owner/mode/SELinux on keystore+truststore+cassandra.yaml
-  18. integrity  store format (JKS/PKCS12), entry counts, SHA-256 duplicates
-  19. revocation OCSP (AIA extension) + CRL Distribution Point check
-
-  Cluster-level (after all nodes):
-      config consistency + TLS mesh (N×N-1)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PERFORMANCE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  --threads N  controls two parallelism levels:
-    Level 1 — N nodes validate concurrently
-    Level 2 — stages 5-19 run concurrently within each node (≤8 workers)
-  keytool outputs cached per-node: only 2 keytool SSH calls per node total.
+Private keys are NEVER read — only keytool -list / -exportcert (public data).
+Keystores inspected in-place via SSH/sudo; never copied locally.
 
 Requirements: PyYAML  (pip install pyyaml)
-Target nodes: openssl, keytool, ss/nc, stat, grep — standard on any DSE host.
-Exit codes: 0 = PASS  |  1 = WARN  |  2 = FAIL
+Exit codes:   0=PASS  1=WARN  2=FAIL
 """
 
 import argparse
@@ -687,10 +608,12 @@ def check_cert(node: Node, warn_days: int, fail_days: int, timeout: int) -> List
                         "Keystore password is wrong or the keystore is corrupt.",
                         "Correct keystore_password in cassandra.yaml, or re-create the keystore.")]
 
-    # ── 2c. Full keytool -list -v (as dse_user) ──────────────────────────────
-    kt_out, _ = ssh_run(node,
-        f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
-        timeout, as_dse=True)
+    # ── 2c. Full keytool -list -v — reuse warm cache if available ────────────
+    kt_out = node._kt_verbose_cache
+    if not kt_out:
+        kt_out, _ = ssh_run(node,
+            f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
+            timeout, as_dse=True)
 
     # Entry type must be PrivateKeyEntry
     if "trustedCertEntry" in kt_out and "PrivateKeyEntry" not in kt_out:
@@ -802,13 +725,8 @@ def check_chain(node: Node, timeout: int) -> List[Finding]:
     is_self_signed = bool(leaf_subj and leaf_issr and
                           _norm_dn(leaf_subj) == _norm_dn(leaf_issr))
 
-    # ── 3b-2. Chain depth from keytool ───────────────────────────────────────
-    # Reuse verbose cache if available; otherwise fetch now.
+    # ── 3b-2. Chain depth from keytool — always reuse warm cache ─────────────
     kt_out = node._kt_verbose_cache or ""
-    if not kt_out:
-        kt_out, _ = ssh_run(node,
-            f'keytool -list -v -keystore {ks} -storepass "{kspw}" -noprompt 2>&1',
-            timeout, as_dse=True)
 
     depth = len(re.findall(r"Certificate\[\d+\]", kt_out))
     if depth == 0:
@@ -1287,10 +1205,12 @@ def check_tls_mesh(nodes: List[Node], timeout: int, threads: int) -> List[Findin
 # Stage 6 — Cert match (keystore vs live TLS fingerprint)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_cert_match(node: Node, port: int, timeout: int) -> List[Finding]:
-    enc = _enc(node)
-    ks  = enc.get("keystore", "")
-    pwd = enc.get("keystore_password", "")
+def check_cert_match(node: Node, timeout: int) -> List[Finding]:
+    """Compare keystore cert fingerprint against the live TLS cert on the node."""
+    enc  = _enc(node)
+    ks   = enc.get("keystore", "")
+    pwd  = enc.get("keystore_password", "")
+    port = _internode_ssl_port(node)
     if not ks or not pwd:
         return []
 
@@ -1904,14 +1824,15 @@ def check_ciphers(node: Node, timeout: int) -> List[Finding]:
                                     f"Weak cipher in config: {cipher}",
                                     f"Replace {cipher} with a modern ECDHE/GCM cipher."))
 
+    port = _internode_ssl_port(node)
     out, _ = ssh_run(node,
-        "echo | timeout 10 openssl s_client -connect localhost:7001 2>/dev/null "
+        f"echo | timeout 10 openssl s_client -connect localhost:{port} 2>/dev/null "
         "| grep '^ *Cipher'", timeout)
     m = re.search(r"Cipher\s*:\s*(\S+)", out)
     if m:
         live = m.group(1)
         findings.append(Finding(node.name, "live_cipher", "INFO",
-                                f"Negotiated cipher on :7001 = {live}"))
+                                f"Negotiated cipher on :{port} = {live}"))
         if _WEAK_FAIL.search(live):
             findings.append(Finding(node.name, "weak_live_cipher", "FAIL",
                                     f"Broken cipher actually negotiated: {live}",
@@ -2110,12 +2031,15 @@ def check_privkey(node: Node, timeout: int) -> List[Finding]:
     # Auto-discover alias — works for any customer alias (dse-node, mykey, etc.)
     alias = _ks_alias(node, timeout)
 
-    # ── 15a. Confirm PrivateKeyEntry exists ──────────────────────────────────
-    kt_out, rc = ssh_run(node,
-        f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
-        timeout, as_dse=True)
-
-    if rc != 0 or "PrivateKeyEntry" not in kt_out:
+    # ── 15a. Confirm PrivateKeyEntry exists — reuse warm cache ───────────────
+    kt_out = node._kt_verbose_cache
+    if not kt_out:
+        kt_out, rc = ssh_run(node,
+            f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
+            timeout, as_dse=True)
+        if rc != 0:
+            kt_out = ""
+    if not kt_out or "PrivateKeyEntry" not in kt_out:
         return [Finding(node.name, "privkey_entry", "FAIL",
                         "No PrivateKeyEntry found in keystore. "
                         "Keystore may contain only certificates (trustedCertEntry).",
@@ -2278,13 +2202,15 @@ def check_alias(node: Node, timeout: int) -> List[Finding]:
         return [Finding(node.name, "alias", "SKIP",
                         "Keystore config missing — alias check skipped.")]
 
-    kt_out, rc = ssh_run(node,
-        f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
-        timeout, as_dse=True)
-
-    if rc != 0:
-        return [Finding(node.name, "alias", "SKIP",
-                        "Keystore not readable — alias check skipped.")]
+    # Reuse warm cache — avoids a duplicate keytool SSH call
+    kt_out = node._kt_verbose_cache
+    if not kt_out:
+        kt_out, rc = ssh_run(node,
+            f'keytool -list -v -keystore {ks} -storepass "{pwd}" -noprompt 2>&1',
+            timeout, as_dse=True)
+        if rc != 0:
+            return [Finding(node.name, "alias", "SKIP",
+                            "Keystore not readable — alias check skipped.")]
 
     # configured_alias: from cassandra.yaml alias field if set, else auto-discover
     configured_alias = _ks_alias(node, timeout)
@@ -2541,16 +2467,16 @@ def check_integrity(node: Node, timeout: int) -> List[Finding]:
                         "No keystore/truststore configured — integrity check skipped.")]
 
     for store_path, store_pwd, store_label in stores:
-        # ── 18a+18b. Readability + password — single keytool call ────────────
-        # Do NOT use "test -r" as a pre-check — it runs as the SSH login user
-        # (automaton), not as dse_user (cassandra), so it always fails for
-        # files owned cassandra:cassandra 600.
-        # keytool -list AS dse_user is the single authoritative readability
-        # and password test: if it succeeds, the file exists and is readable.
-        kt_out, kt_rc = ssh_run(node,
-            f'keytool -list -v -keystore {store_path} -storepass "{store_pwd}" '
-            f'-noprompt 2>&1',
-            timeout, as_dse=True)
+        # ── 18a+18b. Reuse warm cache for keystore; fresh call for truststore ─
+        if store_label == "keystore" and node._kt_verbose_cache:
+            kt_out, kt_rc = node._kt_verbose_cache, 0
+        elif store_label == "truststore" and node._ts_verbose_cache:
+            kt_out, kt_rc = node._ts_verbose_cache, 0
+        else:
+            kt_out, kt_rc = ssh_run(node,
+                f'keytool -list -v -keystore {store_path} -storepass "{store_pwd}" '
+                f'-noprompt 2>&1',
+                timeout, as_dse=True)
 
         if kt_rc != 0:
             lower = kt_out.lower()
@@ -2985,69 +2911,52 @@ ALL_MODULES = ["config", "cert", "chain", "trust", "tls", "match",
                "privkey", "alias", "perms", "integrity", "revocation"]
 
 
-def _step(label: str, fn, findings: List[Finding],
-          gate: bool = False, no_colour: bool = False) -> bool:
-    """
-    Run fn(), append results to findings.
-    If gate=True and any result is FAIL, print the blocking finding and return False.
-    Returns True if execution should continue.
-    """
-    results = fn()
-    findings.extend(results)
-    if gate and _has_fail(results):
-        for f in results:
-            if f.status == "FAIL":
-                badge = _colour("FAIL", "[FAIL]", no_colour)
-                print(f"  {badge}  {f.node}  {f.check}")
-                print(f"          {f.detail}")
-                if f.fix:
-                    print(f"          → {f.fix}")
-        return False
-    return True
-
-
 def validate_node(node: Node, active: set, args,
                   findings: List[Finding]) -> None:
     """
     Run all active modules for one node.
 
-    Gates (stages 1–4) run sequentially — a FAIL stops further checks.
-    Independent stages (5–19) run in parallel within the node using a
-    thread pool: each makes its own SSH connections concurrently, so
-    wall time = slowest single stage instead of sum of all stages.
-
-    Cache warm-up runs first so all parallel stages share the same
-    keytool output without making duplicate SSH calls.
+    Gates 1–4 run sequentially; a FAIL stops the node.
+    Stages 5–19 run in parallel (≤8 workers per node).
+    keytool caches are warmed once and shared by all stages.
+    FAILs are streamed to stdout as they arrive.
     """
-    nc  = args.no_colour
-    t   = args.timeout
+    nc = args.no_colour
+    t  = args.timeout
 
-    def run_seq(module: str, fn, gate: bool = False) -> bool:
+    def _gate(module: str, fn) -> bool:
+        """Run a gate check; return False (stop) if it produces any FAIL."""
         if module not in active:
             return True
-        return _step(f"[{node.name}] {module}", fn, findings, gate=gate, no_colour=nc)
+        results = fn()
+        findings.extend(results)
+        if _has_fail(results):
+            for f in results:
+                if f.status == "FAIL":
+                    print(f"  {_colour('FAIL','[FAIL]',nc)}  {f.node}  {f.check}")
+                    print(f"          {f.detail}")
+                    if f.fix:
+                        print(f"          → {f.fix}")
+            return False
+        return True
 
-    # ── Gates 1–4: sequential (each must pass before the next) ───────────────
-    if not run_seq("config", lambda: check_config(node), gate=True):
+    # ── Gates 1–4 ─────────────────────────────────────────────────────────────
+    if not _gate("config", lambda: check_config(node)):
         return
-    if not run_seq("cert",   lambda: check_cert(node, args.warn_days, args.fail_days, t),
-                   gate=True):
+    if not _gate("cert",   lambda: check_cert(node, args.warn_days, args.fail_days, t)):
         return
 
-    # Warm keytool caches before chain/trust and all parallel stages.
-    # This is the single keytool -list -v call shared by every stage.
+    # Warm caches once — all parallel stages share the result (zero duplicate calls)
     _warm_caches(node, t)
 
-    if not run_seq("chain",  lambda: check_chain(node, t),  gate=True):
+    if not _gate("chain", lambda: check_chain(node, t)):
         return
-    if not run_seq("trust",  lambda: check_trust(node, t),  gate=True):
+    if not _gate("trust", lambda: check_trust(node, t)):
         return
 
-    # ── Stages 5–19: parallel within this node ────────────────────────────────
-    # All these stages are independent — no ordering requirement between them.
-    # Worker count = min(active independent stages, 8) to avoid SSH overload.
+    # ── Stages 5–19: parallel ─────────────────────────────────────────────────
     independent = [
-        ("match",      lambda: check_cert_match(node, 7001, t)),
+        ("match",      lambda: check_cert_match(node, t)),
         ("hostname",   lambda: check_hostname(node, t)),
         ("jmx",        lambda: check_jmx(node, t)),
         ("native",     lambda: check_native_ssl(node, t)),
@@ -3062,32 +2971,26 @@ def validate_node(node: Node, active: set, args,
         ("revocation", lambda: check_revocation(node, t)),
     ]
     to_run = [(mod, fn) for mod, fn in independent if mod in active]
-
     if not to_run:
         return
 
-    workers = min(len(to_run), 8)
-    local_findings: List[Finding] = []
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    local: List[Finding] = []
+    with ThreadPoolExecutor(max_workers=min(len(to_run), 8)) as ex:
         futures = {ex.submit(fn): mod for mod, fn in to_run}
         for fut in as_completed(futures):
-            mod = futures[fut]
             try:
                 results = fut.result()
-                local_findings.extend(results)
-                # Print gating-style immediate output for FAIL findings
+                local.extend(results)
                 for f in results:
                     if f.status == "FAIL":
-                        badge = _colour("FAIL", "[FAIL]", nc)
-                        print(f"  {badge}  {f.node}  {f.check}", flush=True)
+                        print(f"  {_colour('FAIL','[FAIL]',nc)}  {f.node}  {f.check}",
+                              flush=True)
                         print(f"          {f.detail}", flush=True)
                         if f.fix:
                             print(f"          → {f.fix}", flush=True)
             except Exception as exc:
-                log.error("[%s] %s raised: %s", node.name, mod, exc)
-
-    findings.extend(local_findings)
+                log.error("[%s] %s raised: %s", node.name, futures[fut], exc)
+    findings.extend(local)
 
 
 def run(args) -> int:
@@ -3222,27 +3125,22 @@ def run(args) -> int:
         print("\nNo nodes reachable. Exiting.")
         sys.exit(2)
 
-    # ── Parallel validation — one thread per node ─────────────────────────────
-    # Each node runs its full gate + parallel-stage pipeline independently.
-    # For a 3-node cluster this runs all 3 nodes concurrently instead of
-    # back-to-back, cutting total time from 3× to ~1× node time.
+    # ── Parallel validation — stream results as each node finishes ────────────
     print(f"\nValidating {len(reachable)} node(s) in parallel...\n")
-
-    node_workers = min(len(reachable), args.threads)
-    node_findings: dict = {n.name: [] for n in reachable}
 
     def _validate_one(n: Node):
         print(f"  ── {n.name} ({n.host}) ──", flush=True)
         nf: List[Finding] = []
         validate_node(n, active, args, nf)
-        return n.name, nf
+        return nf
 
-    with ThreadPoolExecutor(max_workers=node_workers) as ex:
-        for node_name, nf in ex.map(_validate_one, reachable):
-            node_findings[node_name] = nf
-
-    for n in reachable:
-        all_findings.extend(node_findings[n.name])
+    with ThreadPoolExecutor(max_workers=min(len(reachable), args.threads)) as ex:
+        futures = {ex.submit(_validate_one, n): n for n in reachable}
+        for fut in as_completed(futures):
+            try:
+                all_findings.extend(fut.result())
+            except Exception as exc:
+                log.error("Node validation error: %s", exc)
 
     # ── Cluster-level checks ──────────────────────────────────────────────────
     if "config" in active and len(reachable) > 1:
