@@ -91,8 +91,10 @@ class Node:
     dse_version:  str  = ""
     java_version: str  = ""
     proc_start:   int  = 0
+    # Active encryption context — set by validate_node before any stage runs.
+    # "server_encryption_options" for internode/all; "client_encryption_options" for client mode.
+    enc_key: str = "server_encryption_options"
     # ── Performance caches (populated once, reused across all stages) ─────────
-    # Avoids repeating the same keytool SSH round-trips in every stage.
     _ks_alias_cache:   str  = field(default="",   repr=False)
     _kt_verbose_cache: str  = field(default="",   repr=False)  # keytool -list -v keystore
     _ts_verbose_cache: str  = field(default="",   repr=False)  # keytool -list -v truststore
@@ -336,7 +338,8 @@ def collect(node: Node, work_dir: str, timeout: int) -> Optional[Finding]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _enc(node: Node) -> dict:
-    return node.yaml_data.get("server_encryption_options") or {}
+    """Return the active encryption options block (server or client) from cassandra.yaml."""
+    return node.yaml_data.get(node.enc_key) or {}
 
 
 def _ks_alias(node: Node, timeout: int, as_dse: bool = True) -> str:
@@ -483,74 +486,83 @@ DEPRECATED_PROTOCOLS = {"SSLV2", "SSLV3", "TLSV1", "TLSV1.1"}
 def check_config(node: Node) -> List[Finding]:
     """
     Validate cassandra.yaml encryption options.
-    Returns findings; any FAIL here gates all subsequent cert/trust/TLS checks.
+    Behaviour adapts to the active enc_key:
+      server_encryption_options → internode/all mode gate
+      client_encryption_options → client mode gate
     """
     findings = []
-    enc = _enc(node)
+    enc      = _enc(node)   # reads node.enc_key
+    is_client = (node.enc_key == "client_encryption_options")
+    label     = "client_encryption_options" if is_client else "server_encryption_options"
 
     if not enc:
-        return [Finding(node.name, "server_encryption_options", "WARN",
-                        "server_encryption_options not found in cassandra.yaml.",
-                        "Add server_encryption_options block to cassandra.yaml.")]
+        return [Finding(node.name, label, "FAIL",
+                        f"{label} not found in cassandra.yaml.",
+                        f"Add {label} block to cassandra.yaml.")]
 
-    ie = enc.get("internode_encryption", "none")
-    findings.append(Finding(node.name, "internode_encryption", "INFO",
-                            f"internode_encryption = {ie}"))
+    if is_client:
+        # ── Client mode config gate ──────────────────────────────────────────
+        enabled = enc.get("enabled", False)
+        findings.append(Finding(node.name, "client_ssl_enabled", "INFO",
+                                f"client_encryption_options.enabled = {enabled}"))
+        if not enabled:
+            findings.append(Finding(node.name, "client_ssl_disabled", "WARN",
+                                    "client_encryption_options.enabled = false — "
+                                    "client (CQL) SSL is OFF.",
+                                    "Set enabled: true in client_encryption_options."))
+        for fld in ("keystore", "keystore_password", "truststore", "truststore_password"):
+            if not enc.get(fld):
+                findings.append(Finding(node.name, f"client_{fld}", "FAIL",
+                                        f"client_encryption_options.{fld} is blank or missing.",
+                                        f"Set {fld} in cassandra.yaml client_encryption_options."))
+        if enc.get("optional"):
+            findings.append(Finding(node.name, "client_optional", "WARN",
+                                    "client_encryption_options.optional=true — plaintext CQL allowed.",
+                                    "Set optional: false in production."))
+    else:
+        # ── Server/internode mode config gate ────────────────────────────────
+        ie = enc.get("internode_encryption", "none")
+        findings.append(Finding(node.name, "internode_encryption", "INFO",
+                                f"internode_encryption = {ie}"))
 
-    # ── enable_legacy_ssl_storage_port ───────────────────────────────────────
-    # When false (DSE 6.x default), SSL traffic runs on port 7000 instead of
-    # the dedicated port 7001.  Record it so port checks don't false-alarm.
-    legacy_ssl_port = node.yaml_data.get("enable_legacy_ssl_storage_port", None)
-    if legacy_ssl_port is False:
-        findings.append(Finding(
-            node.name, "legacy_ssl_storage_port", "INFO",
-            "enable_legacy_ssl_storage_port=false — SSL internode traffic uses "
-            "port 7000 (no separate SSL storage port configured). "
-            "Port 7001 will not be open; this is expected.",
-        ))
-    elif legacy_ssl_port is True:
-        findings.append(Finding(
-            node.name, "legacy_ssl_storage_port", "INFO",
-            "enable_legacy_ssl_storage_port=true — SSL internode traffic uses "
-            "port 7001 (dedicated SSL storage port).",
-        ))
-    # If key is absent from yaml, DSE uses its compiled-in default (false for 6.x)
+        legacy_ssl_port = node.yaml_data.get("enable_legacy_ssl_storage_port", None)
+        if legacy_ssl_port is False:
+            findings.append(Finding(node.name, "legacy_ssl_storage_port", "INFO",
+                "enable_legacy_ssl_storage_port=false — SSL uses port 7000."))
+        elif legacy_ssl_port is True:
+            findings.append(Finding(node.name, "legacy_ssl_storage_port", "INFO",
+                "enable_legacy_ssl_storage_port=true — SSL uses port 7001."))
 
-    # Gate fields: keystore, truststore, passwords
-    for fld in ("keystore", "keystore_password", "truststore", "truststore_password"):
-        if not enc.get(fld):
-            findings.append(Finding(node.name, f"server_{fld}", "FAIL",
-                                    f"server_encryption_options.{fld} is blank or missing.",
-                                    f"Set {fld} in cassandra.yaml server_encryption_options."))
+        for fld in ("keystore", "keystore_password", "truststore", "truststore_password"):
+            if not enc.get(fld):
+                findings.append(Finding(node.name, f"server_{fld}", "FAIL",
+                                        f"server_encryption_options.{fld} is blank or missing.",
+                                        f"Set {fld} in cassandra.yaml server_encryption_options."))
 
-    # Protocol
+        if enc.get("optional", False):
+            findings.append(Finding(node.name, "server_optional", "WARN",
+                                    "server_encryption_options.optional=true — plaintext connections allowed.",
+                                    "Set optional: false in production."))
+
+        # Also surface client SSL state as advisory in internode/all mode
+        cenc = node.yaml_data.get("client_encryption_options") or {}
+        if cenc.get("optional"):
+            findings.append(Finding(node.name, "client_optional", "WARN",
+                                    "client_encryption_options.optional=true — plaintext CQL allowed.",
+                                    "Set optional: false."))
+
+    # Protocol + cipher_suites apply to both modes
     proto = enc.get("protocol", "")
     if proto.upper() in DEPRECATED_PROTOCOLS:
         findings.append(Finding(node.name, "deprecated_protocol", "FAIL",
                                 f"Deprecated protocol configured: {proto}",
-                                "Set  protocol: TLS  in server_encryption_options."))
+                                f"Set  protocol: TLS  in {label}."))
     elif proto:
         findings.append(Finding(node.name, "protocol", "INFO", f"protocol = {proto}"))
 
-    # optional=true is dangerous in production
-    if enc.get("optional", False):
-        findings.append(Finding(node.name, "server_optional", "WARN",
-                                "server_encryption_options.optional=true — plaintext connections allowed.",
-                                "Set optional: false in production."))
-
-    # cipher_suites — absence is fine; JVM defaults (TLS_AES_128_GCM_SHA256 etc.)
-    # work correctly in DSE 6.x.  Only report as INFO so the operator is aware.
     if not enc.get("cipher_suites"):
         findings.append(Finding(node.name, "cipher_suites_empty", "INFO",
-                                "cipher_suites not set — JVM default cipher list will be used. "
-                                "This is acceptable; set explicitly only for strict compliance."))
-
-    # client_encryption_options
-    cenc = node.yaml_data.get("client_encryption_options") or {}
-    if cenc.get("optional"):
-        findings.append(Finding(node.name, "client_optional", "WARN",
-                                "client_encryption_options.optional=true — plaintext CQL allowed.",
-                                "Set optional: false."))
+                                "cipher_suites not set — JVM defaults used."))
 
     return findings
 
@@ -2946,6 +2958,14 @@ def validate_node(node: Node, active: set, args,
     """
     nc = args.no_colour
     t  = args.timeout
+
+    # Set the active encryption context so _enc() reads the right YAML block.
+    # client mode → client_encryption_options; everything else → server_encryption_options.
+    node.enc_key = (
+        "client_encryption_options"
+        if active == set(_MODE_MODULES["client"])
+        else "server_encryption_options"
+    )
 
     def _gate(module: str, fn) -> bool:
         """Run a gate check; return False (stop) if it produces any FAIL."""
