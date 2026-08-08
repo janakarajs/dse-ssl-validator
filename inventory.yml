@@ -38,8 +38,11 @@ nodes:
 
 # ── OpsCenter (optional) ─────────────────────────────────────────────────────
 # opscenter:
-#   host:     10.1.1.10
-#   ssh_user: automaton
-#   ssh_key:  ~/.ssh/id_rsa
-#   dse_user: cassandra   # or opscenter if different on OpsCenter host
-#   conf:     /etc/opscenter/opscenterd.conf
+#   host:         10.1.1.10
+#   ssh_user:     automaton
+#   ssh_key:      ~/.ssh/id_rsa
+#   dse_user:     opscenter   # OS user that owns opscenterd.conf
+#   use_sudo:     true
+#   conf:         /etc/opscenter/opscenterd.conf
+#   cluster_conf: /etc/opscenter/clusters  # dir — {cluster_name}.conf must exist here
+#   ssl_dir:      /var/lib/opscenter/ssl

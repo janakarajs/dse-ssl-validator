@@ -1427,27 +1427,28 @@ def _parse_ini_section(text: str, section: str) -> dict:
     return result
 
 
-def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Finding]:
+def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int,
+                    cluster_name: str = "") -> List[Finding]:
     """
     Comprehensive OpsCenter ↔ DSE agent SSL validation.
 
     Covers three layers:
-      A. OpsCenter host — opscenterd.conf, SSL files, cluster conf
+      A. OpsCenter host — opscenterd.conf, SSL files, {cluster_name}.conf
       B. DSE agent nodes — address.yaml, agentKeyStore, port 61621 TLS
       C. Connectivity — OpsCenter Stomp ports reachable from DSE nodes
 
     inventory.yml opscenter block:
       opscenter:
-        host:         10.1.1.10
-        ssh_user:     automaton          # SSH login account
-        ssh_key:      ~/.ssh/id_rsa
-        dse_user:     opscenter          # OS user that owns opscenterd.conf
-        use_sudo:     true               # sudo -u opscenter (NOPASSWD required)
-        conf:         /etc/opscenter/opscenterd.conf
-        ssl_dir:      /var/lib/opscenter/ssl        # where opscenter.key etc live
-        cluster_conf: /etc/opscenter/clusters       # directory of cluster .conf files
-        agent_yaml:   /var/lib/datastax-agent/conf/address.yaml  # path on DSE nodes
-        agent_ssl_dir: /var/lib/datastax-agent/ssl               # agentKeyStore dir on DSE nodes
+        host:          10.1.1.10
+        ssh_user:      automaton          # SSH login account
+        ssh_key:       ~/.ssh/id_rsa
+        dse_user:      opscenter          # OS user that owns opscenterd.conf
+        use_sudo:      true               # sudo -u opscenter (NOPASSWD required)
+        conf:          /etc/opscenter/opscenterd.conf
+        ssl_dir:       /var/lib/opscenter/ssl
+        cluster_conf:  /etc/opscenter/clusters   # dir; {cluster_name}.conf lives here
+        agent_yaml:    /var/lib/datastax-agent/conf/address.yaml
+        agent_ssl_dir: /var/lib/datastax-agent/ssl
     """
     findings: List[Finding] = []
     conf_path    = ops_cfg.get("conf",          "/etc/opscenter/opscenterd.conf")
@@ -1585,21 +1586,43 @@ def check_opscenter(ops_cfg: dict, nodes: List[Node], timeout: int) -> List[Find
                                             "OpsCenter requires a PEM private key here.",
                                             f"Set ssl_keyfile = {ssl_dir}/opscenter.key"))
 
-    # ── A4. Cluster conf files — agent + cassandra keystores ─────────────────
-    # /etc/opscenter/clusters/<name>.conf holds [agents] and [cassandra] sections
-    # with keystore/truststore paths for DSE nodes and OpsCenter CQL connections.
+    # ── A4. Cluster conf files — {cluster_name}.conf + any others ────────────
+    # /etc/opscenter/clusters/{cluster_name}.conf holds [agents] and [cassandra]
+    # sections with keystore/truststore paths.  We check the named file first
+    # (using inventory cluster_name) then scan for any other *.conf in the dir.
+    named_conf = f"{cluster_dir}/{cluster_name}.conf" if cluster_name else ""
     cluster_confs_out, _ = ssh_run(ops,
         f"ls {cluster_dir}/*.conf 2>/dev/null", timeout, as_dse=True)
-    cluster_files = [f.strip() for f in cluster_confs_out.splitlines()
-                     if f.strip().endswith(".conf")]
+    all_confs = [f.strip() for f in cluster_confs_out.splitlines()
+                 if f.strip().endswith(".conf")]
 
-    for cf in cluster_files:
+    # Ensure named conf is checked first and exactly once
+    if named_conf and named_conf not in all_confs:
+        # Named file not in glob — check if it exists at all
+        _, probe_rc = ssh_run(ops, f"test -f {named_conf} && echo OK",
+                              timeout, as_dse=True)
+        if probe_rc == 0:
+            all_confs.insert(0, named_conf)
+        else:
+            findings.append(Finding("opscenter", "cluster_conf_named", "WARN",
+                                    f"{cluster_name}.conf not found at {named_conf}.",
+                                    f"Expected: {named_conf}  — verify cluster_name "
+                                    f"in inventory.yml matches the OpsCenter cluster name."))
+    elif named_conf in all_confs:
+        # Promote named conf to front so it's checked first
+        all_confs = [named_conf] + [c for c in all_confs if c != named_conf]
+
+    for cf in all_confs:
+        is_named = (cf == named_conf)
         cf_content, cf_rc = ssh_run(ops, f"cat {cf} 2>/dev/null",
                                     timeout, as_dse=True)
         if cf_rc != 0 or not cf_content.strip():
             findings.append(Finding("opscenter", "cluster_conf", "WARN",
                                     f"Cluster conf not readable: {cf}"))
             continue
+        if is_named:
+            findings.append(Finding("opscenter", "cluster_conf_named", "PASS",
+                                    f"{cluster_name}.conf found and readable at {cf}."))
 
         cf_name = cf.split("/")[-1]
         cc_agents = _parse_ini_section(cf_content, "agents")
@@ -3068,7 +3091,8 @@ def run(args) -> int:
         validate_node(local_node, active, args, all_findings)
 
         if "opscenter" in active and ops_cfg:
-            all_findings += check_opscenter(ops_cfg, [local_node], args.timeout)
+            all_findings += check_opscenter(ops_cfg, [local_node], args.timeout,
+                                            cluster_name)
 
         shutil.rmtree(work_dir, ignore_errors=True)
         print_report(all_findings, args.no_colour)
@@ -3151,7 +3175,8 @@ def run(args) -> int:
         all_findings += check_tls_mesh(reachable, args.timeout, args.threads)
 
     if "opscenter" in active and ops_cfg:
-        all_findings += check_opscenter(ops_cfg, reachable, args.timeout)
+        all_findings += check_opscenter(ops_cfg, reachable, args.timeout,
+                                        cluster_name)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     shutil.rmtree(work_dir, ignore_errors=True)
